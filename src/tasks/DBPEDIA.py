@@ -5,18 +5,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-from datasets import ClassLabel, load_dataset
+from datasets import load_dataset
 from transformers import AutoTokenizer
 import numpy as np
 from collections import Counter
 
-ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-2])
+ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-3])
 import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
 __all__ = [
-    "AMAZON_CHAT_TEMPLATE_LLAMA31",
+    "DBPEDIA_CHAT_TEMPLATE_LLAMA31",
     "example_to_messages",
     "render_chat",
     "format_prompt",
@@ -25,7 +25,7 @@ __all__ = [
     "compute_accuracy"
 ]
 
-AMAZON_CHAT_TEMPLATE_LLAMA31 = (
+DBPEDIA_CHAT_TEMPLATE_LLAMA31 = (
     "{{ bos_token }}"
     "{% for message in messages %}"
     "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' "
@@ -37,21 +37,30 @@ AMAZON_CHAT_TEMPLATE_LLAMA31 = (
 )
 
 def _build_answer(index:int)->str:
-    letters = string.ascii_uppercase[:5]
+    letters = string.ascii_uppercase[:14]
     if index < 0 or index > len(letters)-1:
         raise ValueError(f'Option must be in [0, {len(letters)-1}],but got {index}.')
     return letters[index]
 
 _prompt_title = '###Title: '
-_prompt_content = '###Review: '
+_prompt_content = '###Content: '
 _prompt_format_after = (
-    'What is the star rating of this product review?\n'
-    'A. 1 star\n'
-    'B. 2 stars\n'
-    'C. 3 stars\n'
-    'D. 4 stars\n'
-    'E. 5 stars\n'
-    'Answer with A, B, C, D or E only.\n'
+    'What is the category of this entity?\n'
+    'A. Company\n'
+    'B. EducationalInstitution\n'
+    'C. Artist\n'
+    'D. Athlete\n'
+    'E. OfficeHolder\n'
+    'F. MeanOfTransportation\n'
+    'G. Building\n'
+    'H. NaturalPlace\n'
+    'I. Village\n'
+    'J. Animal\n'
+    'K. Plant\n'
+    'L. Album\n'
+    'M. Film\n'
+    'N. WrittenWork\n'
+    'Answer with A, B, C, D, E, F, G, H, I, J, K, L, M or N only.\n'
     'Answer:'
 )
 
@@ -101,7 +110,7 @@ def extract_answer_letter(text: str) -> Optional[str]:
     text_u = text.strip().upper()
 
     # 例如：B、B.、(B)、B)
-    m = re.fullmatch(r"\(?([ABCDE])\)?[.。]?\)?", text_u)
+    m = re.fullmatch(r"\(?([ABCDEFGHIJKLMN])\)?[.。]?\)?", text_u)
     if m:
         return m.group(1)
 
@@ -111,14 +120,14 @@ def extract_answer_letter(text: str) -> Optional[str]:
         r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
         r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
         r"|OPTION|CHOICE"
-        r")\s*[:：]?\s*\(?([ABCDE])\b",
+        r")\s*[:：]?\s*\(?([ABCDEFGHIJKLMN])\b",
         text_u,
     )
     if m:
         return m.group(1)
 
     # 例如：B. 后面跟选项说明
-    m = re.match(r"^([ABCDE])[.)、]\s*", text_u)
+    m = re.match(r"^([ABCDEFGHIJKLMN])[.)、]\s*", text_u)
     if m:
         return m.group(1)
 
@@ -138,20 +147,18 @@ def compute_accuracy(preds, golds):
         return 0.0
     return sum(p == l for p,l in zip(preds,golds))/len(golds)
 
-def load_amazon_data(
+def load_dbpedia_data(
     cache_dir = f'{ROOT_DIR}/.cache/huggingface_models/',
     token = None,
     seed = 1
 ):
     # 一次加载和划分，返回三个集合供后续复用。
     ds = load_dataset(
-        "vgaraujov/amazon_review_full",
+        "fancyzhx/dbpedia_14",
         split='train',
         cache_dir=cache_dir,
         token=token
     )
-    # Amazon 的标签为 0–4 的整数，分层划分需要 ClassLabel。
-    ds = ds.cast_column('label', ClassLabel(names=['1 star', '2 stars', '3 stars', '4 stars', '5 stars']))
     # 在划分前添加原始行号，用来检查集合之间是否交叉。
     ds = ds.add_column('idx', np.arange(len(ds), dtype=np.int64))
     rng_seed = 1 if seed is None else seed
@@ -170,46 +177,102 @@ def load_amazon_data(
 
     return {"train": train_set, "val": val_set, "test": test_set}
 
-def _balanced_subsample(ds, n_per_class:int , seed:int =1, label_col:str = 'label'):
+def _filter_by_length(ds, tokenizer, max_length=1536):
+    # 统计完整训练对话，包括模板、选项和 assistant 答案，不做截断。
+    if not isinstance(max_length, (int, np.integer)) or max_length <= 0:
+        raise ValueError('max_length must be a positive integer')
+    kept = []
+    for start in range(0, len(ds), 128):
+        batch = ds.select(range(start, min(start + 128, len(ds))))
+        texts = [format_prompt(example, tokenizer, include_answer=True) for example in batch]
+        encoded = tokenizer(
+            texts, add_special_tokens=False, truncation=False,
+            padding=False, return_attention_mask=False, verbose=False,
+        )
+        for i, ids in enumerate(encoded['input_ids']):
+            if len(ids) <= max_length:
+                kept.append(start + i)
+    return ds.select(kept)
+
+
+def _balanced_subsample(ds, n_per_class:int , seed:int =1, label_col:str = 'label',
+                        tokenizer=None, max_length=1536):
     if not isinstance(n_per_class, (int, np.integer)) or n_per_class <= 0:
         raise ValueError('n_per_class must be a positive integer')
     rng = np.random.default_rng(seed)
     labels = np.asarray(ds[label_col])
     picked = []
+    checked = 0
+    rejected = 0
     for lab in np.unique(labels):
-        idx = np.flatnonzero(labels == lab)
-        if len(idx)<n_per_class:
-            raise ValueError(f'class {lab} has only {len(idx)} examples, need {n_per_class}')
-        picked.append(rng.choice(idx, size=n_per_class,replace=False))
+        remaining = np.flatnonzero(labels == lab)
+        selected = []
+        while len(selected) < n_per_class:
+            need = n_per_class - len(selected)
+            if len(remaining) < need:
+                raise ValueError(
+                    f'class {lab} has too few eligible examples after length filtering; '
+                    f'need {n_per_class}, selected {len(selected)}'
+                )
+            candidates = rng.choice(remaining, size=need, replace=False)
+            if tokenizer is None:
+                selected.extend(candidates.tolist())
+            else:
+                batch = ds.select(candidates.tolist())
+                filtered = _filter_by_length(batch, tokenizer, max_length)
+                valid_idx = set(filtered['idx'])
+                selected.extend(int(i) for i in candidates if ds[int(i)]['idx'] in valid_idx)
+                checked += len(batch)
+                rejected += len(batch) - len(filtered)
+            remaining = np.setdiff1d(remaining, candidates, assume_unique=True)
+        picked.append(np.asarray(selected, dtype=np.int64))
     picked = rng.permutation(np.concatenate(picked))
+    if tokenizer is not None:
+        print(f'Length filter (<= {max_length} tokens): checked {checked}, removed {rejected}')
     return ds.select(picked.tolist())
 
-def build_amazon_files(out_dir, n_train=1600, n_val=400, n_test = 400, seed=1):
+
+def build_dbpedia_files(out_dir, n_train=1000, n_val=125, n_test = 125, seed=1,
+                      max_length=1536, tokenizer=None):
     os.makedirs(out_dir, exist_ok=True)
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(
+            os.path.join(ROOT_DIR, 'Llama-3.1-8B-Instruct'), local_files_only=True,
+        )
+    tokenizer.chat_template = DBPEDIA_CHAT_TEMPLATE_LLAMA31
+    tokenizer.model_max_length = max_length
     sizes = {
         'train':n_train,
         'test':n_test,
         'val':n_val
     }
-    # 完整数据只加载、转换和划分一次。
-    datasets = load_amazon_data(seed=seed)
+    # 完整数据只加载和划分一次；仅检查抽样候选，避免编码全部 56 万条。
+    datasets = load_dbpedia_data(seed=seed)
     seen_idx = {}
+    subsets = {}
     for split, n in sizes.items():
         ds = datasets[split]
-        sub = _balanced_subsample(ds, n,seed=seed)
-        sub.to_json(os.path.join(out_dir,f'{split}.jsonl'), force_ascii=False)
+        # 超长候选被排除后继续抽取，直到每类数量补齐。
+        sub = _balanced_subsample(
+            ds, n, seed=seed, tokenizer=tokenizer, max_length=max_length,
+        )
         seen_idx[split] = set(sub['idx'])
         counts = Counter(sub['label'])
-        assert len(set(counts.values())) == 1, f'{split} not balanced: {counts}'
-        print(split, len(sub),dict(counts))
+        assert counts == {label: n for label in range(14)}, f'{split} not balanced: {counts}'
+        assert len(seen_idx[split]) == len(sub), f'{split} has repeated source rows'
+        subsets[split] = sub
     assert not (seen_idx['train'] & seen_idx['val'])
     assert not (seen_idx['train'] & seen_idx['test'])
     assert not (seen_idx['val'] & seen_idx['test'])
+    # 所有集合检查通过后再写出，避免过滤后数量不足时只更新部分文件。
+    for split, sub in subsets.items():
+        sub.to_json(os.path.join(out_dir,f'{split}.jsonl'), force_ascii=False)
+        print(split, len(sub),dict(Counter(sub['label'])))
 
 if __name__ == '__main__':
-    data_path = os.path.join(ROOT_DIR, "data", "AMAZON")
+    data_path = os.path.join(ROOT_DIR, "data", "DBPEDIA")
     os.makedirs(data_path,exist_ok=True)
-    build_amazon_files(data_path)
+    build_dbpedia_files(data_path)
     # 导出之后只读取抽样后的 JSONL，不再处理完整数据。
     datasets = load_dataset(
         'json',
@@ -227,8 +290,8 @@ if __name__ == '__main__':
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "right"
-    tokenizer.model_max_length = 1500
-    tokenizer.chat_template = AMAZON_CHAT_TEMPLATE_LLAMA31
+    tokenizer.model_max_length = 1536
+    tokenizer.chat_template = DBPEDIA_CHAT_TEMPLATE_LLAMA31
 
     print(
         f"\nLength of train set: {len(dataset_train)}, val set: {len(dataset_val)}, "
@@ -265,7 +328,7 @@ if __name__ == '__main__':
     # Sanity check: label extraction.
     gold_label = extract_label_from_example(sample)
     parsed_label = extract_answer_letter(example_to_messages(sample)[-1]["content"])
-    assert gold_label in 'ABCDE'
+    assert gold_label in 'ABCDEFGHIJKLMN'
     assert gold_label == parsed_label
     print(f"\nGold label: {gold_label}, Parsed label: {parsed_label}")
 
@@ -274,4 +337,4 @@ if __name__ == '__main__':
     labels = [gold_label, "Z"]
     print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")
     assert compute_accuracy(predictions, labels) == 0.5
-    print("AMAZON sanity checks: PASS")
+    print("DBPEDIA sanity checks: PASS")

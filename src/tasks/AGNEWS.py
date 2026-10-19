@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 import numpy as np
 from collections import Counter
 
-ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-2])
+ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-3])
 import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)

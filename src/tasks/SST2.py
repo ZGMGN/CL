@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 import numpy as np
 from collections import Counter
 
-ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-2])
+ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-3])
 import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
@@ -133,20 +133,50 @@ def compute_accuracy(preds, golds):
         return 0.0
     return sum(p == l for p,l in zip(preds,golds))/len(golds)
 
+def _sentence_key(sentence: str) -> str:
+    # 合并连续空白并忽略大小写；仅用于判重，保留原始文本。
+    return " ".join(sentence.split()).casefold()
+
 def load_sst2_data(
-    split:str = 'train',
+    split:Optional[str] = 'train',
     cache_dir = f'{ROOT_DIR}/.cache/huggingface_models/',
     token = None,
     seed = 1
 ):
-    assert split in ['train', 'test', 'val'], f"split must be 'train','test',or 'val' but got {split}."
+    assert split in ['train', 'test', 'val', None], f"invalid split: {split}"
     ds = load_dataset(
-        "nyu-mll/glue", 
+        "nyu-mll/glue",
         "sst2",
         split='train',
         cache_dir=cache_dir,
         token=token
     )
+    # 先检查整个训练集，再保留每种无冲突文本第一次出现的样本。
+    first_seen = {}
+    conflicting_keys = set()
+    keys = []
+    for i, (sentence, label) in enumerate(zip(ds['sentence'], ds['label'])):
+        if label not in (0, 1):
+            raise ValueError(f'Invalid SST2 label at row {i}: {label}')
+        key = _sentence_key(sentence)
+        keys.append(key)
+        if not key:
+            continue
+        if key not in first_seen:
+            first_seen[key] = (i, label)
+        elif first_seen[key][1] != label:
+            conflicting_keys.add(key)
+
+    kept = [i for key, (i, _) in first_seen.items() if key not in conflicting_keys]
+    empty_rows = sum(not key for key in keys)
+    conflicting_rows = sum(key in conflicting_keys for key in keys)
+    duplicate_rows = len(ds) - len(kept) - empty_rows - conflicting_rows
+    print(
+        f'SST2 cleanup: {len(ds)} -> {len(kept)} rows; '
+        f'duplicates removed: {duplicate_rows}; empty rows: {empty_rows}; '
+        f'conflicting groups: {len(conflicting_keys)} ({conflicting_rows} rows)'
+    )
+    ds = ds.select(kept)
     rng_seed = 1 if seed is None else seed
     stratify_col = 'label'
     train_val_and_test = ds.train_test_split(
@@ -164,6 +194,8 @@ def load_sst2_data(
     train_set = train_and_val["train"]
     val_set = train_and_val["test"]
 
+    if split is None:
+        return {"train": train_set, "val": val_set, "test": test_set}
     if split == "train":
         return train_set
     return val_set
@@ -187,13 +219,28 @@ def build_sst2_files(out_dir, n_train=4000, n_val=1000, n_test = 1000, seed=1):
         'test':n_test,
         'val':n_val
     }
+    # 去重、冲突处理和划分只做一次。
+    datasets = load_sst2_data(split=None, seed=seed)
+    subsets = {}
+    seen_idx = {}
+    seen_text = {}
     for split, n in sizes.items():
-        ds = load_sst2_data(split, seed=seed)
+        ds = datasets[split]
         sub = _balanced_subsample(ds, n,seed=seed)
-        sub.to_json(os.path.join(out_dir,f'{split}.jsonl'), force_ascii=False)
         counts = Counter(sub['label'])
-        assert len(set(counts.values())) == 1, f'{split} not balanced: {counts}'
-        print(split, len(sub),dict(counts))
+        assert counts == {0: n, 1: n}, f'{split} not balanced: {counts}'
+        seen_idx[split] = set(sub['idx'])
+        seen_text[split] = {_sentence_key(text) for text in sub['sentence']}
+        assert len(seen_idx[split]) == len(sub), f'{split} has repeated source rows'
+        assert len(seen_text[split]) == len(sub), f'{split} has repeated text'
+        subsets[split] = sub
+    for left, right in [('train', 'val'), ('train', 'test'), ('val', 'test')]:
+        assert not (seen_idx[left] & seen_idx[right]), f'{left}/{right} share source rows'
+        assert not (seen_text[left] & seen_text[right]), f'{left}/{right} share text'
+    # 所有检查通过后再写文件，避免抽样失败时只更新部分 split。
+    for split, sub in subsets.items():
+        sub.to_json(os.path.join(out_dir,f'{split}.jsonl'), force_ascii=False)
+        print(split, len(sub),dict(Counter(sub['label'])))
 
 
 if __name__ == "__main__":

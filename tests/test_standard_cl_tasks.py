@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import inspect
 import json
 import runpy
 import tempfile
@@ -38,7 +39,7 @@ class StandardCLTasksTest(unittest.TestCase):
     def setUpClass(cls):
         cls.modules = {}
         for task in CONFIGS:
-            spec = importlib.util.spec_from_file_location(task, ROOT / 'tasks' / f'{task}.py')
+            spec = importlib.util.spec_from_file_location(task, ROOT / 'src' / 'tasks' / f'{task}.py')
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             cls.modules[task] = module
@@ -115,22 +116,26 @@ class StandardCLTasksTest(unittest.TestCase):
                 self.assertTrue(full.endswith('<|start_header_id|>assistant<|end_header_id|>\n\nA<|eot_id|>'))
 
     def test_amazon_main_loads_source_once_and_reads_jsonl(self):
-        self._check_main_loads_source_once('AMAZON', 'vgaraujov/amazon_review_full', 3000, 1600, 400)
+        self._check_main_loads_source_once('AMAZON', 'vgaraujov/amazon_review_full', 3000)
 
     def test_dbpedia_main_loads_source_once_and_reads_jsonl(self):
-        self._check_main_loads_source_once('DBPEDIA', 'fancyzhx/dbpedia_14', 4000, 2000, 500)
+        self._check_main_loads_source_once('DBPEDIA', 'fancyzhx/dbpedia_14', 4000)
 
     def test_yahoo_main_loads_source_once_and_reads_jsonl(self):
-        self._check_main_loads_source_once('YAHOO', 'community-datasets/yahoo_answers_topics', 4000, 2000, 500)
+        self._check_main_loads_source_once('YAHOO', 'community-datasets/yahoo_answers_topics', 4000)
 
     def test_yelp_main_loads_source_once_and_reads_jsonl(self):
-        self._check_main_loads_source_once('YELP', 'Yelp/yelp_review_full', 4000, 2000, 500)
+        self._check_main_loads_source_once('YELP', 'Yelp/yelp_review_full', 4000)
 
-    def _check_main_loads_source_once(self, task, dataset_id, per_class, n_train, n_eval):
+    def _check_main_loads_source_once(self, task, dataset_id, per_class):
         if self.tokenizer is None:
             self.skipTest('Local Llama tokenizer is not available')
         source = make_source(task, per_class=per_class)
         count = CONFIGS[task][0]
+        defaults = inspect.signature(getattr(self.modules[task], f'build_{task.lower()}_files')).parameters
+        n_train = defaults['n_train'].default
+        n_val = defaults['n_val'].default
+        n_test = defaults['n_test'].default
         original_export = Dataset.to_json
         original_split = Dataset.train_test_split
         split_calls = []
@@ -161,15 +166,15 @@ class StandardCLTasksTest(unittest.TestCase):
                  patch.object(Dataset, 'train_test_split', new=count_split), \
                  patch.object(AutoTokenizer, 'from_pretrained', return_value=self.tokenizer), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
-                runpy.run_path(str(ROOT / 'tasks' / f'{task}.py'), run_name='__main__')
+                runpy.run_path(str(ROOT / 'src' / 'tasks' / f'{task}.py'), run_name='__main__')
             self.assertEqual([call.args[0] for call in loader.call_args_list],
                              [dataset_id, 'json'])
             self.assertEqual(split_calls, [len(source), len(source) * 4 // 5])
-            self.assertIn(f'Length of train set: {count * n_train}, val set: {count * n_eval}, test set: {count * n_eval}', output.getvalue())
+            self.assertIn(f'Length of train set: {count * n_train}, val set: {count * n_val}, test set: {count * n_test}', output.getvalue())
             self.assertIn(f'{task} sanity checks: PASS', output.getvalue())
             self.assertIn('Tiny accuracy check (expect 0.5): 0.5', output.getvalue())
             indices = {}
-            for split, n in (('train', n_train), ('val', n_eval), ('test', n_eval)):
+            for split, n in (('train', n_train), ('val', n_val), ('test', n_test)):
                 rows = [json.loads(line) for line in (Path(tmp) / f'{split}.jsonl').read_text().splitlines()]
                 self.assertEqual(Counter(row['label'] for row in rows), {i: n for i in range(count)})
                 indices[split] = {row['idx'] for row in rows}

@@ -10,13 +10,13 @@ from transformers import AutoTokenizer
 import numpy as np
 from collections import Counter
 
-ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-2])
+ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-3])
 import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
 __all__ = [
-    "YAHOO_CHAT_TEMPLATE_LLAMA31",
+    "YELP_CHAT_TEMPLATE_LLAMA31",
     "example_to_messages",
     "render_chat",
     "format_prompt",
@@ -25,7 +25,7 @@ __all__ = [
     "compute_accuracy"
 ]
 
-YAHOO_CHAT_TEMPLATE_LLAMA31 = (
+YELP_CHAT_TEMPLATE_LLAMA31 = (
     "{{ bos_token }}"
     "{% for message in messages %}"
     "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' "
@@ -37,27 +37,20 @@ YAHOO_CHAT_TEMPLATE_LLAMA31 = (
 )
 
 def _build_answer(index:int)->str:
-    letters = string.ascii_uppercase[:10]
+    letters = string.ascii_uppercase[:5]
     if index < 0 or index > len(letters)-1:
         raise ValueError(f'Option must be in [0, {len(letters)-1}],but got {index}.')
     return letters[index]
 
-_prompt_question_title = '###Question title: '
-_prompt_question_content = '###Question content: '
-_prompt_best_answer = '###Best answer: '
+_prompt_text = '###Review: '
 _prompt_format_after = (
-    'What is the topic of this question and answer?\n'
-    'A. Society & Culture\n'
-    'B. Science & Mathematics\n'
-    'C. Health\n'
-    'D. Education & Reference\n'
-    'E. Computers & Internet\n'
-    'F. Sports\n'
-    'G. Business & Finance\n'
-    'H. Entertainment & Music\n'
-    'I. Family & Relationships\n'
-    'J. Politics & Government\n'
-    'Answer with A, B, C, D, E, F, G, H, I or J only.\n'
+    'What is the star rating of this business review?\n'
+    'A. 1 star\n'
+    'B. 2 stars\n'
+    'C. 3 stars\n'
+    'D. 4 stars\n'
+    'E. 5 stars\n'
+    'Answer with A, B, C, D or E only.\n'
     'Answer:'
 )
 
@@ -65,9 +58,7 @@ def _single_example_to_message(example:Dict[str, Any])->List[Dict[str,str]]:
     return [
         {
             'role':'user',
-            'content':_prompt_question_title+(example['question_title'] or '').strip()+ '\n'
-            +_prompt_question_content+(example['question_content'] or '').strip()+ '\n'
-            +_prompt_best_answer+(example['best_answer'] or '').strip()+ '\n'+_prompt_format_after
+            'content':_prompt_text+(example['text'] or '').strip()+ '\n'+_prompt_format_after
         },
         {
             'role':'assistant',
@@ -76,16 +67,14 @@ def _single_example_to_message(example:Dict[str, Any])->List[Dict[str,str]]:
     ]
 
 def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
-    if isinstance(example['question_title'],str) or example['question_title'] is None:
+    if isinstance(example['text'],str) or example['text'] is None:
         return _single_example_to_message(example)
     messages = []
-    for i in range(len(example['question_title'])):
+    for i in range(len(example['text'])):
         messages.append(
             _single_example_to_message(
                 {
-                    'question_title':example['question_title'][i],
-                    'question_content':example['question_content'][i],
-                    'best_answer':example['best_answer'][i],
+                    'text':example['text'][i],
                     'label':example['label'][i]
                 }
             )
@@ -109,7 +98,7 @@ def extract_answer_letter(text: str) -> Optional[str]:
     text_u = text.strip().upper()
 
     # 例如：B、B.、(B)、B)
-    m = re.fullmatch(r"\(?([ABCDEFGHIJ])\)?[.。]?\)?", text_u)
+    m = re.fullmatch(r"\(?([ABCDE])\)?[.。]?\)?", text_u)
     if m:
         return m.group(1)
 
@@ -119,14 +108,14 @@ def extract_answer_letter(text: str) -> Optional[str]:
         r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
         r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
         r"|OPTION|CHOICE"
-        r")\s*[:：]?\s*\(?([ABCDEFGHIJ])\b",
+        r")\s*[:：]?\s*\(?([ABCDE])\b",
         text_u,
     )
     if m:
         return m.group(1)
 
     # 例如：B. 后面跟选项说明
-    m = re.match(r"^([ABCDEFGHIJ])[.)、]\s*", text_u)
+    m = re.match(r"^([ABCDE])[.)、]\s*", text_u)
     if m:
         return m.group(1)
 
@@ -146,20 +135,18 @@ def compute_accuracy(preds, golds):
         return 0.0
     return sum(p == l for p,l in zip(preds,golds))/len(golds)
 
-def load_yahoo_data(
+def load_yelp_data(
     cache_dir = f'{ROOT_DIR}/.cache/huggingface_models/',
     token = None,
     seed = 1
 ):
     # 一次加载和划分，返回三个集合供后续复用。
     ds = load_dataset(
-        "community-datasets/yahoo_answers_topics",
+        "Yelp/yelp_review_full",
         split='train',
         cache_dir=cache_dir,
         token=token
     )
-    # Yahoo 原始标签列名为 topic，统一为 label。
-    ds = ds.rename_column('topic', 'label')
     # 在划分前添加原始行号，用来检查集合之间是否交叉。
     ds = ds.add_column('idx', np.arange(len(ds), dtype=np.int64))
     rng_seed = 1 if seed is None else seed
@@ -192,7 +179,7 @@ def _balanced_subsample(ds, n_per_class:int , seed:int =1, label_col:str = 'labe
     picked = rng.permutation(np.concatenate(picked))
     return ds.select(picked.tolist())
 
-def build_yahoo_files(out_dir, n_train=1000, n_val=200, n_test = 200, seed=1):
+def build_yelp_files(out_dir, n_train=1600, n_val=400, n_test = 400, seed=1):
     os.makedirs(out_dir, exist_ok=True)
     sizes = {
         'train':n_train,
@@ -200,7 +187,7 @@ def build_yahoo_files(out_dir, n_train=1000, n_val=200, n_test = 200, seed=1):
         'val':n_val
     }
     # 完整数据只加载和划分一次。
-    datasets = load_yahoo_data(seed=seed)
+    datasets = load_yelp_data(seed=seed)
     seen_idx = {}
     for split, n in sizes.items():
         ds = datasets[split]
@@ -215,9 +202,9 @@ def build_yahoo_files(out_dir, n_train=1000, n_val=200, n_test = 200, seed=1):
     assert not (seen_idx['val'] & seen_idx['test'])
 
 if __name__ == '__main__':
-    data_path = os.path.join(ROOT_DIR, "data", "YAHOO")
+    data_path = os.path.join(ROOT_DIR, "data", "YELP")
     os.makedirs(data_path,exist_ok=True)
-    build_yahoo_files(data_path)
+    build_yelp_files(data_path)
     # 导出之后只读取抽样后的 JSONL，不再处理完整数据。
     datasets = load_dataset(
         'json',
@@ -236,7 +223,7 @@ if __name__ == '__main__':
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "right"
     tokenizer.model_max_length = 1500
-    tokenizer.chat_template = YAHOO_CHAT_TEMPLATE_LLAMA31
+    tokenizer.chat_template = YELP_CHAT_TEMPLATE_LLAMA31
 
     print(
         f"\nLength of train set: {len(dataset_train)}, val set: {len(dataset_val)}, "
@@ -273,7 +260,7 @@ if __name__ == '__main__':
     # Sanity check: label extraction.
     gold_label = extract_label_from_example(sample)
     parsed_label = extract_answer_letter(example_to_messages(sample)[-1]["content"])
-    assert gold_label in 'ABCDEFGHIJ'
+    assert gold_label in 'ABCDE'
     assert gold_label == parsed_label
     print(f"\nGold label: {gold_label}, Parsed label: {parsed_label}")
 
@@ -282,4 +269,4 @@ if __name__ == '__main__':
     labels = [gold_label, "Z"]
     print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")
     assert compute_accuracy(predictions, labels) == 0.5
-    print("YAHOO sanity checks: PASS")
+    print("YELP sanity checks: PASS")

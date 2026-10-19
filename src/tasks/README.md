@@ -19,10 +19,10 @@ original text fields. Prompts map labels to A–E, A–E, A–N, and A–J respe
 From the project directory, run any task separately:
 
 ```bash
-python tasks/AMAZON.py
-python tasks/YELP.py
-python tasks/DBPEDIA.py
-python tasks/YAHOO.py
+python src/tasks/AMAZON.py
+python src/tasks/YELP.py
+python src/tasks/DBPEDIA.py
+python src/tasks/YAHOO.py
 ```
 
 Each task writes `train.jsonl`, `val.jsonl` and `test.jsonl` into `data/<TASK>/`,
@@ -48,7 +48,7 @@ Loaders return a dictionary of full custom splits; builders call the loader
 once and export balanced subsamples. All sizes and `seed` can be set in Python:
 
 ```python
-from tasks.AMAZON import build_amazon_files
+from src.tasks.AMAZON import build_amazon_files
 
 build_amazon_files('data/AMAZON', n_train=1000, n_val=200, n_test=200, seed=1)
 ```
@@ -91,3 +91,15 @@ YAHOO and YELP also return dictionaries from `load_yahoo_data(seed=1)` and
 load and split the source once, and their main blocks reuse the exported JSONL
 for all checks. Yahoo still renames `topic` to `label`; both tasks keep their
 2000/500/500 per-class sampling defaults.
+
+YAHOO exports only samples whose complete Llama training conversation (template,
+input fields, choices and assistant answer) is at most 1536 tokens. The builder
+checks sampled candidates and draws replacements for rejected examples until
+each class reaches its configured count; it does not encode all 1.4M source
+rows. `build_yahoo_files(..., max_length=1536)` uses the local Llama tokenizer.
+Overlong samples are dropped, not truncated.
+
+DBPEDIA uses the same complete-chat 1536-token filter as YAHOO, including
+choices and assistant answers. Rejected candidates are replaced to retain
+1000/125/125 samples per class. `build_dbpedia_files(..., max_length=1536)`
+loads the local Llama tokenizer and never truncates individual samples.

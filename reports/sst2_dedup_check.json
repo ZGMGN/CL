@@ -1,0 +1,56 @@
+{
+  "splits": {
+    "train": {
+      "rows": 8000,
+      "label_counts": {
+        "0": 4000,
+        "1": 4000
+      },
+      "duplicate_normalized_text_rows": 0,
+      "duplicate_idx_rows": 0,
+      "max_training_tokens": 99,
+      "over_1500": 0,
+      "message_and_template_check": "PASS"
+    },
+    "val": {
+      "rows": 2000,
+      "label_counts": {
+        "0": 1000,
+        "1": 1000
+      },
+      "duplicate_normalized_text_rows": 0,
+      "duplicate_idx_rows": 0,
+      "max_training_tokens": 97,
+      "over_1500": 0,
+      "message_and_template_check": "PASS"
+    },
+    "test": {
+      "rows": 2000,
+      "label_counts": {
+        "0": 1000,
+        "1": 1000
+      },
+      "duplicate_normalized_text_rows": 0,
+      "duplicate_idx_rows": 0,
+      "max_training_tokens": 96,
+      "over_1500": 0,
+      "message_and_template_check": "PASS"
+    }
+  },
+  "overlap": {
+    "train/val": {
+      "idx": 0,
+      "normalized_text": 0
+    },
+    "train/test": {
+      "idx": 0,
+      "normalized_text": 0
+    },
+    "val/test": {
+      "idx": 0,
+      "normalized_text": 0
+    }
+  },
+  "tiny_accuracy": 0.5,
+  "result": "PASS"
+}

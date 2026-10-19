@@ -1,0 +1,46 @@
+{
+  "max_length": 1536,
+  "splits": {
+    "train": {
+      "rows": 10000,
+      "per_class": 1000,
+      "max_training_tokens": 1450,
+      "over_1536": 0,
+      "duplicate_inputs": 0
+    },
+    "val": {
+      "rows": 2000,
+      "per_class": 200,
+      "max_training_tokens": 1421,
+      "over_1536": 0,
+      "duplicate_inputs": 0
+    },
+    "test": {
+      "rows": 2000,
+      "per_class": 200,
+      "max_training_tokens": 1347,
+      "over_1536": 0,
+      "duplicate_inputs": 0
+    }
+  },
+  "overlap": {
+    "train/val": {
+      "idx": 0,
+      "normalized_input": 0
+    },
+    "train/test": {
+      "idx": 0,
+      "normalized_input": 0
+    },
+    "val/test": {
+      "idx": 0,
+      "normalized_input": 0
+    }
+  },
+  "filter_log": [
+    "Length filter (<= 1536 tokens): checked 10004, removed 4",
+    "Length filter (<= 1536 tokens): checked 2001, removed 1",
+    "Length filter (<= 1536 tokens): checked 2000, removed 0"
+  ],
+  "result": "PASS"
+}

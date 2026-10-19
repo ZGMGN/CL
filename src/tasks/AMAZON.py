@@ -5,18 +5,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-from datasets import load_dataset
+from datasets import ClassLabel, load_dataset
 from transformers import AutoTokenizer
 import numpy as np
 from collections import Counter
 
-ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-2])
+ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-3])
 import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
 __all__ = [
-    "QQP_CHAT_TEMPLATE_LLAMA31",
+    "AMAZON_CHAT_TEMPLATE_LLAMA31",
     "example_to_messages",
     "render_chat",
     "format_prompt",
@@ -25,7 +25,7 @@ __all__ = [
     "compute_accuracy"
 ]
 
-QQP_CHAT_TEMPLATE_LLAMA31 = (
+AMAZON_CHAT_TEMPLATE_LLAMA31 = (
     "{{ bos_token }}"
     "{% for message in messages %}"
     "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' "
@@ -35,33 +35,32 @@ QQP_CHAT_TEMPLATE_LLAMA31 = (
     "{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}"
     "{% endif %}"
 )
-_prompt_question1 = (
-    '###Question1: '
-)
-_prompt_question2 = (
-    '###Question2: '
-)
+
+def _build_answer(index:int)->str:
+    letters = string.ascii_uppercase[:5]
+    if index < 0 or index > len(letters)-1:
+        raise ValueError(f'Option must be in [0, {len(letters)-1}],but got {index}.')
+    return letters[index]
+
+_prompt_title = '###Title: '
+_prompt_content = '###Review: '
 _prompt_format_after = (
-    'Are these two questions duplicates?\n'
-    'A. No\n'
-    'B. Yes\n'
-    'Answer with A or B only.\n'
+    'What is the star rating of this product review?\n'
+    'A. 1 star\n'
+    'B. 2 stars\n'
+    'C. 3 stars\n'
+    'D. 4 stars\n'
+    'E. 5 stars\n'
+    'Answer with A, B, C, D or E only.\n'
     'Answer:'
 )
 
-def _build_answer(index:int)->str:
-    letters = string.ascii_uppercase
-    if index <0 or index >= len(letters):
-        raise ValueError(f'Option index must be in [0, {len(letters)-1}], but got {index}.')
-    return letters[index]
-
-def _single_example_to_message(example:Dict[str, Any])->List[Dict[str, str]]:
+def _single_example_to_message(example:Dict[str, Any])->List[Dict[str,str]]:
     return [
         {
             'role':'user',
-            'content':_prompt_question1+example['question1']+'\n'
-            +_prompt_question2+example['question2']+'\n'
-            +_prompt_format_after
+            'content':_prompt_title+(example['title'] or '').strip()+ '\n'
+            +_prompt_content+(example['content'] or '').strip()+ '\n'+_prompt_format_after
         },
         {
             'role':'assistant',
@@ -69,103 +68,99 @@ def _single_example_to_message(example:Dict[str, Any])->List[Dict[str, str]]:
         },
     ]
 
-def example_to_messages(example: Dict[str, Any])-> List[Dict[str, str]]:
-    if isinstance(example['question1'], str):
+def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
+    if isinstance(example['title'],str) or example['title'] is None:
         return _single_example_to_message(example)
     messages = []
-    for i in range(len(example['question1'])):
+    for i in range(len(example['title'])):
         messages.append(
             _single_example_to_message(
                 {
-                    'question1':example['question1'][i],
-                    'question2':example['question2'][i],
-                    'label':example['label'][i],
+                    'title':example['title'][i],
+                    'content':example['content'][i],
+                    'label':example['label'][i]
                 }
             )
         )
     return messages
 
-def render_chat(messages:List[Dict[str,str]], tokenizer, add_generation_prompt:bool = False)->str:
+def render_chat(messages: List[Dict[str,str]],tokenizer, add_generation_prompt=False):
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=add_generation_prompt,
     )
 
-def format_prompt(example:Dict[str,Any],tokenizer,include_answer:bool=False)->str:
+def format_prompt(example:Dict[str,Any],tokenizer,include_answer):
     messages = example_to_messages(example)
     if not include_answer:
-        messages = [msg for msg in messages if msg['role']!='assistant']
-    return render_chat(messages, tokenizer, add_generation_prompt=not include_answer)
+        messages = [msg for msg in messages if msg['role'] != 'assistant']
+    return render_chat(messages, tokenizer, add_generation_prompt= not include_answer)
 
-def extract_answer_letter(text:str)->Optional[str]:
+def extract_answer_letter(text: str) -> Optional[str]:
     text_u = text.strip().upper()
 
-    m = re.match(r"^([A-Z])[\.\):\s]", text_u)
+    # 例如：B、B.、(B)、B)
+    m = re.fullmatch(r"\(?([ABCDE])\)?[.。]?\)?", text_u)
     if m:
         return m.group(1)
-    if len(text_u) == 1 and text_u.isalpha():
-        return text_u
-    m = re.search(r"\b([A-Z])[.\):\s]", text_u)
-    if m:
-        return m.group(1)
-		#不再要求字母在开头，而是在任意位置找“字母 + 点/括号/冒号/空白”。
+
+    # 例如：The correct answer is B、Answer: C、Option D
     m = re.search(
-        r"(?:THE\s+)?CORRECT\s+ANSWER\s*(?:IS|:|-)?\s*"
-        r"(?:OPTION|CHOICE)?\s*([A-Z])\b",
+        r"\b(?:"
+        r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
+        r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
+        r"|OPTION|CHOICE"
+        r")\s*[:：]?\s*\(?([ABCDE])\b",
         text_u,
     )
     if m:
-        return m.group(1)    
-    matches = re.findall(r"\b([A-Z])\b", text_u)
-    if matches:
-        return matches[-1]
-		#最后的兜底：找出所有独立的单个大写字母，返回最后一个:I think it is B
+        return m.group(1)
+
+    # 例如：B. 后面跟选项说明
+    m = re.match(r"^([ABCDE])[.)、]\s*", text_u)
+    if m:
+        return m.group(1)
+
     return None
 
-def extract_label_from_example(example:Dict[str,Any])->Optional[str]:
+def extract_label_from_example(example):
     messages = example_to_messages(example)
     for msg in reversed(messages):
         if msg['role'] == 'assistant':
             return extract_answer_letter(msg['content'])
     return None
 
-
-def compute_accuracy(preds: List[str], labels: List[str]) -> float:
-    if len(preds) != len(labels):
-        raise ValueError("预测数量和标签数量必须一致")
-    if not labels:
+def compute_accuracy(preds, golds):
+    if len(preds) != len(golds):
+        raise ValueError('长度不一致')
+    if not preds:
         return 0.0
+    return sum(p == l for p,l in zip(preds,golds))/len(golds)
 
-    correct = sum(p == l for p, l in zip(preds, labels))
-    return correct / len(labels)
-
-def _load_QQP_data(
-    split:str = 'train',
-    cache_dir: str = f'{ROOT_DIR}/.cache/huggingface_models/',
-    token: Optional[str] = None,
-    seed: Optional[int] = 1,
+def load_amazon_data(
+    cache_dir = f'{ROOT_DIR}/.cache/huggingface_models/',
+    token = None,
+    seed = 1
 ):
-    assert split in ['train','val','test'], f"split must be 'train','val','test',but got {split}"
-    dataset = load_dataset(
-        "nyu-mll/glue",
-        "qqp",
-        split = 'train',
-        cache_dir = cache_dir,
-        token = token,
+    # 一次加载和划分，返回三个集合供后续复用。
+    ds = load_dataset(
+        "vgaraujov/amazon_review_full",
+        split='train',
+        cache_dir=cache_dir,
+        token=token
     )
+    # Amazon 的标签为 0–4 的整数，分层划分需要 ClassLabel。
+    ds = ds.cast_column('label', ClassLabel(names=['1 star', '2 stars', '3 stars', '4 stars', '5 stars']))
+    # 在划分前添加原始行号，用来检查集合之间是否交叉。
+    ds = ds.add_column('idx', np.arange(len(ds), dtype=np.int64))
     rng_seed = 1 if seed is None else seed
-
     stratify_col = 'label'
-    # 6:2:2 split
-    train_val_and_test = dataset.train_test_split(
+    train_val_and_test = ds.train_test_split(
         test_size=0.2, seed=rng_seed, stratify_by_column=stratify_col
     )
     train_val_set = train_val_and_test["train"]
     test_set = train_val_and_test["test"]
-
-    if split == "test":
-        return test_set
 
     train_and_val = train_val_set.train_test_split(
         test_size=0.25, seed=rng_seed, stratify_by_column=stratify_col
@@ -173,42 +168,36 @@ def _load_QQP_data(
     train_set = train_and_val["train"]
     val_set = train_and_val["test"]
 
-    if split == "train":
-        return train_set
-    return val_set
+    return {"train": train_set, "val": val_set, "test": test_set}
 
-def _balanced_subsample(ds, n_per_class:int, seed:int=1, label_col:str = 'label'):
+def _balanced_subsample(ds, n_per_class:int , seed:int =1, label_col:str = 'label'):
+    if not isinstance(n_per_class, (int, np.integer)) or n_per_class <= 0:
+        raise ValueError('n_per_class must be a positive integer')
     rng = np.random.default_rng(seed)
-    #获取一个随机数生成器
     labels = np.asarray(ds[label_col])
-    #转换成np数组
     picked = []
-    #用来保存每个类别中抽中的样本索引
     for lab in np.unique(labels):
-    #这里lab是单个类别，不是单个类别的索引列表
         idx = np.flatnonzero(labels == lab)
-        #这里idx才是该标签在的位置
-        if len(idx) < n_per_class:
+        if len(idx)<n_per_class:
             raise ValueError(f'class {lab} has only {len(idx)} examples, need {n_per_class}')
-        picked.append(rng.choice(idx, size=n_per_class, replace=False))
-        #表示从 idx 中随机抽取 n_per_class 个元素，且不重复抽取(replace参数控制)。
+        picked.append(rng.choice(idx, size=n_per_class,replace=False))
     picked = rng.permutation(np.concatenate(picked))
-    #np.concatenate是合并数组，permutation是随机打乱顺序
     return ds.select(picked.tolist())
-    #把numpy数组转为list，然后从ds中挑选这些索引
 
-def build_qqp_files(out_dir, n_train=4000, n_val=500,n_test=500,seed=1):
+def build_amazon_files(out_dir, n_train=1600, n_val=400, n_test = 400, seed=1):
     os.makedirs(out_dir, exist_ok=True)
     sizes = {
         'train':n_train,
-        'val':n_val,
-        'test':n_test
+        'test':n_test,
+        'val':n_val
     }
+    # 完整数据只加载、转换和划分一次。
+    datasets = load_amazon_data(seed=seed)
     seen_idx = {}
-    for split,n in sizes.items():
-        ds = _load_QQP_data(split, seed=seed)
-        sub = _balanced_subsample(ds, n, seed=seed)
-        sub.to_json(os.path.join(out_dir, f'{split}.jsonl'),force_ascii=False)
+    for split, n in sizes.items():
+        ds = datasets[split]
+        sub = _balanced_subsample(ds, n,seed=seed)
+        sub.to_json(os.path.join(out_dir,f'{split}.jsonl'), force_ascii=False)
         seen_idx[split] = set(sub['idx'])
         counts = Counter(sub['label'])
         assert len(set(counts.values())) == 1, f'{split} not balanced: {counts}'
@@ -218,34 +207,43 @@ def build_qqp_files(out_dir, n_train=4000, n_val=500,n_test=500,seed=1):
     assert not (seen_idx['val'] & seen_idx['test'])
 
 if __name__ == '__main__':
-    data_path = os.path.join(ROOT_DIR, "data",'QQP')
+    data_path = os.path.join(ROOT_DIR, "data", "AMAZON")
     os.makedirs(data_path,exist_ok=True)
-    #build_qqp_files(data_path)
-    dataset_train = _load_QQP_data(split='train')
-    dataset_val = _load_QQP_data(split="val")
-    dataset_test = _load_QQP_data(split="test")
+    build_amazon_files(data_path)
+    # 导出之后只读取抽样后的 JSONL，不再处理完整数据。
+    datasets = load_dataset(
+        'json',
+        data_files={
+            split: os.path.join(data_path, f'{split}.jsonl')
+            for split in ['train', 'val', 'test']
+        },
+        cache_dir=f'{ROOT_DIR}/.cache/huggingface_models/',
+    )
+    dataset_train = datasets['train']
+    dataset_val = datasets['val']
+    dataset_test = datasets['test']
 
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(ROOT_DIR, r"Llama-3.1-8B-Instruct"))
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "right"
     tokenizer.model_max_length = 1500
-    tokenizer.chat_template = QQP_CHAT_TEMPLATE_LLAMA31
+    tokenizer.chat_template = AMAZON_CHAT_TEMPLATE_LLAMA31
 
     print(
         f"\nLength of train set: {len(dataset_train)}, val set: {len(dataset_val)}, "
         f"test set: {len(dataset_test)}"
-    )  
+    )
     for split in ['train','val','test']:
         print(f'\n\nRendering some {split} examples...')
-        ds = _load_QQP_data(split=split)
+        ds = datasets[split]
         for i in range(2):
             example = ds[i]
             messages = example_to_messages(example)
             rendered = render_chat(messages, tokenizer, add_generation_prompt=False)
             print(f"\n--- Example {i} ---\n")
             print(rendered)
-        
+
         k = min(2, len(ds))
         batched = ds[:k]
         batched_messages = example_to_messages(batched)
@@ -267,9 +265,13 @@ if __name__ == '__main__':
     # Sanity check: label extraction.
     gold_label = extract_label_from_example(sample)
     parsed_label = extract_answer_letter(example_to_messages(sample)[-1]["content"])
+    assert gold_label in 'ABCDE'
+    assert gold_label == parsed_label
     print(f"\nGold label: {gold_label}, Parsed label: {parsed_label}")
 
     # Sanity check: tiny accuracy check.
     predictions = [gold_label, gold_label]
     labels = [gold_label, "Z"]
-    print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")           
+    print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")
+    assert compute_accuracy(predictions, labels) == 0.5
+    print("AMAZON sanity checks: PASS")
