@@ -27,22 +27,25 @@ python tasks/YAHOO.py
 
 Each task writes `train.jsonl`, `val.jsonl` and `test.jsonl` into `data/<TASK>/`,
 using uppercase task names. Re-running replaces that task's existing files.
-By default `HF_ENDPOINT` is `https://hf-mirror.com`; a preconfigured endpoint is
-respected. Downloads require network access and sufficient local storage.
+Like the existing tasks, each module sets `HF_ENDPOINT` to
+`https://hf-mirror.com`. Downloads require network access and sufficient local storage.
 
-The `n_train=2000`, `n_val=500`, `n_test=500` defaults are **per class**:
+Sample sizes are **per class**. Amazon uses 1600/400/400; the other
+new tasks use 2000/500/500 by default:
 
 | Task | Train total | Validation total | Test total |
 | --- | ---: | ---: | ---: |
-| AMAZON | 10000 | 2500 | 2500 |
+| AMAZON | 8000 | 2000 | 2000 |
 | YELP | 10000 | 2500 | 2500 |
 | DBPEDIA | 28000 | 7000 | 7000 |
 | YAHOO | 20000 | 5000 | 5000 |
 
-Each module provides `load_<task>_data`, `build_<task>_files` and the existing
-message / formatting / accuracy helpers. `load_<task>_data` returns the full
-custom split; builders export balanced subsamples. Builders load the upstream
-dataset once. All sizes and `seed` can be set in Python:
+Each module follows the AGNEWS / QQP / SST2 file structure: explicit prompt
+strings, `_single_example_to_message`, `example_to_messages`, `render_chat`,
+`format_prompt`, answer / label extraction, accuracy, `load_<task>_data`,
+`_balanced_subsample`, `build_<task>_files`, and an inline `__main__` block.
+Loaders return a dictionary of full custom splits; builders call the loader
+once and export balanced subsamples. All sizes and `seed` can be set in Python:
 
 ```python
 from tasks.AMAZON import build_amazon_files
@@ -50,11 +53,12 @@ from tasks.AMAZON import build_amazon_files
 build_amazon_files('data/AMAZON', n_train=1000, n_val=200, n_test=200, seed=1)
 ```
 
-`example_to_messages`, `format_prompt`, and `extract_label_from_example` support
-both single examples and column-oriented batches. `format_prompt` can omit the
-answer without requiring a label. Set the module's `<TASK>_CHAT_TEMPLATE_LLAMA31`
-on your tokenizer when using Llama 3.1. Pass only generated response text to
-`extract_answer_letter`, without the original prompt and choices.
+`example_to_messages` accepts a single example or a column-oriented batch.
+As in AGNEWS / QQP / SST2, `format_prompt` and `extract_label_from_example`
+operate on single examples; pass batched messages to `render_chat` one by one.
+`format_prompt` takes an explicit `include_answer` argument. Set the module's
+`<TASK>_CHAT_TEMPLATE_LLAMA31` on the tokenizer when using Llama 3.1.
+Pass only generated response text to `extract_answer_letter`.
 
 Offline checks (synthetic data; no dataset download):
 
@@ -63,3 +67,27 @@ python -m unittest discover -s tests -p 'test_standard_cl_tasks.py'
 ```
 
 The local tokenizer rendering check runs if `Llama-3.1-8B-Instruct` is present.
+
+After exporting, the `__main__` block loads the three local JSONL splits once,
+initializes the local Llama tokenizer, renders single and batch examples,
+preview a prompt without an answer, check label extraction, and verify accuracy
+is 0.5 on the tiny example. It does not load model weights or run inference.
+
+Amazon uses `n_train=1600`, `n_val=400`, `n_test=400` per class. Its builder
+calls `load_amazon_data()` once to obtain all three full splits.
+The main block then loads the exported JSONL once and reuses it for every
+sanity check. `load_amazon_data()` returns a dictionary with `train`, `val`
+and `test` keys; it has no `split` parameter. Use `datasets['train']` to select
+a split from that returned dictionary.
+
+DBpedia follows the same reuse pattern: `load_dbpedia_data(seed=1)` returns
+`{"train": train_set, "val": val_set, "test": test_set}` without a `split`
+parameter. `build_dbpedia_files` calls it once, and the main block reads the
+exported JSONL once for the remaining checks. Its per-class defaults remain
+2000/500/500.
+
+YAHOO and YELP also return dictionaries from `load_yahoo_data(seed=1)` and
+`load_yelp_data(seed=1)`. Neither accepts a `split` parameter. Their builders
+load and split the source once, and their main blocks reuse the exported JSONL
+for all checks. Yahoo still renames `topic` to `label`; both tasks keep their
+2000/500/500 per-class sampling defaults.

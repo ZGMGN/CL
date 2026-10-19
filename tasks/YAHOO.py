@@ -1,34 +1,28 @@
-"""YAHOO classification with the project's stratified 6:2:2 split.
-
-n_train, n_val and n_test specify samples PER CLASS, not total samples.
-Only the upstream training split is used; test.jsonl is a custom held-out split.
-"""
-
 import os
 import re
 import string
-from collections import Counter
-from numbers import Integral
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple
 
-os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
+from datasets import load_dataset
+from transformers import AutoTokenizer
 import numpy as np
-from datasets import ClassLabel, load_dataset
+from collections import Counter
 
-ROOT_DIR = str(Path(__file__).resolve().parents[1])
-DATASET_ID = 'community-datasets/yahoo_answers_topics'
-CLASS_NAMES = ('Society & Culture', 'Science & Mathematics', 'Health', 'Education & Reference', 'Computers & Internet', 'Sports', 'Business & Finance', 'Entertainment & Music', 'Family & Relationships', 'Politics & Government')
-TEXT_FIELDS = (('question_title', 'Question title'), ('question_content', 'Question content'), ('best_answer', 'Best answer'))
-SOURCE_LABEL_COL = 'topic'
-ANSWER_LETTERS = string.ascii_uppercase[:len(CLASS_NAMES)]
-MessageList = List[Dict[str, str]]
+ROOT_DIR = '/'.join(os.path.realpath(__file__).split('/')[:-2])
+import sys
+import_dir = os.path.join(ROOT_DIR, 'src')
+sys.path.insert(0, import_dir)
 
 __all__ = [
-    'YAHOO_CHAT_TEMPLATE_LLAMA31', 'example_to_messages', 'render_chat',
-    'format_prompt', 'extract_answer_letter', 'extract_label_from_example',
-    'compute_accuracy', 'load_yahoo_data', 'build_yahoo_files',
+    "YAHOO_CHAT_TEMPLATE_LLAMA31",
+    "example_to_messages",
+    "render_chat",
+    "format_prompt",
+    "extract_answer_letter",
+    "extract_label_from_example",
+    "compute_accuracy"
 ]
 
 YAHOO_CHAT_TEMPLATE_LLAMA31 = (
@@ -42,165 +36,250 @@ YAHOO_CHAT_TEMPLATE_LLAMA31 = (
     "{% endif %}"
 )
 
-_PROMPT_SUFFIX = (
-    'What is the topic of this question and answer?' + '\n'
-    + '\n'.join(f'{letter}. {name}' for letter, name in zip(ANSWER_LETTERS, CLASS_NAMES))
-    + '\nAnswer with ' + ', '.join(ANSWER_LETTERS) + ' only.\nAnswer:'
+def _build_answer(index:int)->str:
+    letters = string.ascii_uppercase[:10]
+    if index < 0 or index > len(letters)-1:
+        raise ValueError(f'Option must be in [0, {len(letters)-1}],but got {index}.')
+    return letters[index]
+
+_prompt_question_title = '###Question title: '
+_prompt_question_content = '###Question content: '
+_prompt_best_answer = '###Best answer: '
+_prompt_format_after = (
+    'What is the topic of this question and answer?\n'
+    'A. Society & Culture\n'
+    'B. Science & Mathematics\n'
+    'C. Health\n'
+    'D. Education & Reference\n'
+    'E. Computers & Internet\n'
+    'F. Sports\n'
+    'G. Business & Finance\n'
+    'H. Entertainment & Music\n'
+    'I. Family & Relationships\n'
+    'J. Politics & Government\n'
+    'Answer with A, B, C, D, E, F, G, H, I or J only.\n'
+    'Answer:'
 )
 
+def _single_example_to_message(example:Dict[str, Any])->List[Dict[str,str]]:
+    return [
+        {
+            'role':'user',
+            'content':_prompt_question_title+(example['question_title'] or '').strip()+ '\n'
+            +_prompt_question_content+(example['question_content'] or '').strip()+ '\n'
+            +_prompt_best_answer+(example['best_answer'] or '').strip()+ '\n'+_prompt_format_after
+        },
+        {
+            'role':'assistant',
+            'content':_build_answer(example['label'])
+        },
+    ]
 
-def _build_answer(index: int) -> str:
-    if not isinstance(index, Integral) or not 0 <= index < len(CLASS_NAMES):
-        raise ValueError(f'YAHOO label must be in [0, {len(CLASS_NAMES) - 1}], got {index}')
-    return ANSWER_LETTERS[index]
+def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
+    if isinstance(example['question_title'],str) or example['question_title'] is None:
+        return _single_example_to_message(example)
+    messages = []
+    for i in range(len(example['question_title'])):
+        messages.append(
+            _single_example_to_message(
+                {
+                    'question_title':example['question_title'][i],
+                    'question_content':example['question_content'][i],
+                    'best_answer':example['best_answer'][i],
+                    'label':example['label'][i]
+                }
+            )
+        )
+    return messages
 
-
-def _user_message(example: Dict[str, Any]) -> Dict[str, str]:
-    parts = []
-    for field, heading in TEXT_FIELDS:
-        value = example[field]
-        if value is None:
-            value = ''
-        if not isinstance(value, str):
-            raise TypeError(f'{field} must be a string or None')
-        parts.append(f'###{heading}: {value.strip()}')
-    return {'role': 'user', 'content': '\n'.join(parts) + '\n' + _PROMPT_SUFFIX}
-
-
-def _is_batched(example: Dict[str, Any]) -> bool:
-    return not isinstance(example[TEXT_FIELDS[0][0]], (str, type(None)))
-
-
-def _batch_rows(example: Dict[str, Any]):
-    fields = [field for field, _ in TEXT_FIELDS]
-    if 'label' in example:
-        fields.append('label')
-    size = len(example[fields[0]])
-    if any(len(example[field]) != size for field in fields):
-        raise ValueError('Batch columns must have the same length')
-    return [{field: example[field][i] for field in fields} for i in range(size)]
-
-
-def _single_example_to_message(example: Dict[str, Any]) -> MessageList:
-    return [_user_message(example), {'role': 'assistant', 'content': _build_answer(example['label'])}]
-
-
-def example_to_messages(example: Dict[str, Any]) -> Union[MessageList, List[MessageList]]:
-    if _is_batched(example):
-        return [_single_example_to_message(row) for row in _batch_rows(example)]
-    return _single_example_to_message(example)
-
-
-def render_chat(messages: MessageList, tokenizer, add_generation_prompt: bool = False) -> str:
+def render_chat(messages: List[Dict[str,str]],tokenizer, add_generation_prompt=False):
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
     )
 
-
-def format_prompt(example: Dict[str, Any], tokenizer, include_answer: bool = False) -> Union[str, List[str]]:
-    if _is_batched(example):
-        return [format_prompt(row, tokenizer, include_answer) for row in _batch_rows(example)]
-    messages = _single_example_to_message(example) if include_answer else [_user_message(example)]
-    return render_chat(messages, tokenizer, add_generation_prompt=not include_answer)
-
+def format_prompt(example:Dict[str,Any],tokenizer,include_answer):
+    messages = example_to_messages(example)
+    if not include_answer:
+        messages = [msg for msg in messages if msg['role'] != 'assistant']
+    return render_chat(messages, tokenizer, add_generation_prompt= not include_answer)
 
 def extract_answer_letter(text: str) -> Optional[str]:
-    """Parse only generated answer text, without the original prompt/options."""
     text_u = text.strip().upper()
-    letters = re.escape(ANSWER_LETTERS)
-    m = re.fullmatch(rf'\(?([{letters}])\)?[.。]?', text_u)
+
+    # 例如：B、B.、(B)、B)
+    m = re.fullmatch(r"\(?([ABCDEFGHIJ])\)?[.。]?\)?", text_u)
     if m:
         return m.group(1)
+
+    # 例如：The correct answer is B、Answer: C、Option D
     m = re.search(
-        rf'\b(?:(?:THE\s+)?(?:CORRECT\s+)?ANSWER\s*(?:IS\b|:|：|-)?'
-        rf'\s*(?:OPTION\b|CHOICE\b)?|OPTION|CHOICE)\s*[:：]?\s*\(?([{letters}])\b',
+        r"\b(?:"
+        r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
+        r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
+        r"|OPTION|CHOICE"
+        r")\s*[:：]?\s*\(?([ABCDEFGHIJ])\b",
         text_u,
     )
     if m:
         return m.group(1)
-    m = re.match(rf'^([{letters}])[.)、]\s*', text_u)
-    return m.group(1) if m else None
 
+    # 例如：B. 后面跟选项说明
+    m = re.match(r"^([ABCDEFGHIJ])[.)、]\s*", text_u)
+    if m:
+        return m.group(1)
 
-def extract_label_from_example(example: Dict[str, Any]) -> Union[str, List[str]]:
-    if _is_batched(example):
-        return [_build_answer(row['label']) for row in _batch_rows(example)]
-    return _build_answer(example['label'])
+    return None
 
+def extract_label_from_example(example):
+    messages = example_to_messages(example)
+    for msg in reversed(messages):
+        if msg['role'] == 'assistant':
+            return extract_answer_letter(msg['content'])
+    return None
 
-def compute_accuracy(preds, golds) -> float:
+def compute_accuracy(preds, golds):
     if len(preds) != len(golds):
-        raise ValueError('Prediction and label lengths must match')
-    if len(golds) == 0:
+        raise ValueError('长度不一致')
+    if not preds:
         return 0.0
-    return sum(p == gold for p, gold in zip(preds, golds)) / len(golds)
-
-
-def _load_source_data(cache_dir, token):
-    ds = load_dataset(DATASET_ID, split='train', cache_dir=cache_dir, token=token)
-    if SOURCE_LABEL_COL != 'label':
-        ds = ds.rename_column(SOURCE_LABEL_COL, 'label')
-    # Amazon's CSV labels are integers; stratify_by_column requires ClassLabel.
-    ds = ds.cast_column('label', ClassLabel(names=list(CLASS_NAMES)))
-    if 'idx' not in ds.column_names:
-        ds = ds.add_column('idx', list(range(len(ds))))
-    return ds
-
-
-def _split_data(ds, seed):
-    rng_seed = 1 if seed is None else seed
-    first = ds.train_test_split(test_size=0.2, seed=rng_seed, stratify_by_column='label')
-    second = first['train'].train_test_split(test_size=0.25, seed=rng_seed, stratify_by_column='label')
-    return {'train': second['train'], 'val': second['test'], 'test': first['test']}
-
+    return sum(p == l for p,l in zip(preds,golds))/len(golds)
 
 def load_yahoo_data(
-    split: str = 'train', cache_dir: str = f'{ROOT_DIR}/.cache/huggingface_models/',
-    token: Optional[str] = None, seed: Optional[int] = 1,
+    cache_dir = f'{ROOT_DIR}/.cache/huggingface_models/',
+    token = None,
+    seed = 1
 ):
-    if split not in ('train', 'val', 'test'):
-        raise ValueError(f'split must be train, val or test, got {split}')
-    return _split_data(_load_source_data(cache_dir, token), seed)[split]
+    # 一次加载和划分，返回三个集合供后续复用。
+    ds = load_dataset(
+        "community-datasets/yahoo_answers_topics",
+        split='train',
+        cache_dir=cache_dir,
+        token=token
+    )
+    # Yahoo 原始标签列名为 topic，统一为 label。
+    ds = ds.rename_column('topic', 'label')
+    # 在划分前添加原始行号，用来检查集合之间是否交叉。
+    ds = ds.add_column('idx', np.arange(len(ds), dtype=np.int64))
+    rng_seed = 1 if seed is None else seed
+    stratify_col = 'label'
+    train_val_and_test = ds.train_test_split(
+        test_size=0.2, seed=rng_seed, stratify_by_column=stratify_col
+    )
+    train_val_set = train_val_and_test["train"]
+    test_set = train_val_and_test["test"]
 
+    train_and_val = train_val_set.train_test_split(
+        test_size=0.25, seed=rng_seed, stratify_by_column=stratify_col
+    )
+    train_set = train_and_val["train"]
+    val_set = train_and_val["test"]
 
-def _balanced_subsample(ds, n_per_class: int, seed: int = 1, label_col: str = 'label'):
-    if not isinstance(n_per_class, Integral) or n_per_class <= 0:
+    return {"train": train_set, "val": val_set, "test": test_set}
+
+def _balanced_subsample(ds, n_per_class:int , seed:int =1, label_col:str = 'label'):
+    if not isinstance(n_per_class, (int, np.integer)) or n_per_class <= 0:
         raise ValueError('n_per_class must be a positive integer')
-    rng = np.random.default_rng(1 if seed is None else seed)
+    rng = np.random.default_rng(seed)
     labels = np.asarray(ds[label_col])
-    if len(labels) == 0:
-        raise ValueError('Cannot sample an empty dataset')
     picked = []
     for lab in np.unique(labels):
         idx = np.flatnonzero(labels == lab)
-        if len(idx) < n_per_class:
+        if len(idx)<n_per_class:
             raise ValueError(f'class {lab} has only {len(idx)} examples, need {n_per_class}')
-        picked.append(rng.choice(idx, size=n_per_class, replace=False))
-    return ds.select(rng.permutation(np.concatenate(picked)).tolist())
+        picked.append(rng.choice(idx, size=n_per_class,replace=False))
+    picked = rng.permutation(np.concatenate(picked))
+    return ds.select(picked.tolist())
 
-
-def build_yahoo_files(
-    out_dir, n_train: int = 2000, n_val: int = 500, n_test: int = 500, seed: int = 1,
-    cache_dir: str = f'{ROOT_DIR}/.cache/huggingface_models/', token: Optional[str] = None,
-):
-    """Export raw fields + label + idx; sample sizes are per class."""
-    parts = _split_data(_load_source_data(cache_dir, token), seed)
-    sizes = {'train': n_train, 'val': n_val, 'test': n_test}
-    subsets = {}
-    for split, n in sizes.items():
-        sub = _balanced_subsample(parts[split], n, seed=seed)
-        counts = Counter(sub['label'])
-        if counts != {lab: n for lab in range(len(CLASS_NAMES))}:
-            raise ValueError(f'{split} has missing or unbalanced classes: {counts}')
-        subsets[split] = sub
-    for left, right in (('train', 'val'), ('train', 'test'), ('val', 'test')):
-        if set(subsets[left]['idx']) & set(subsets[right]['idx']):
-            raise ValueError(f'{left} and {right} share source rows')
+def build_yahoo_files(out_dir, n_train=1000, n_val=200, n_test = 200, seed=1):
     os.makedirs(out_dir, exist_ok=True)
-    for split, sub in subsets.items():
-        sub.to_json(os.path.join(out_dir, f'{split}.jsonl'), force_ascii=False)
-        print(split, len(sub), dict(Counter(sub['label'])))
-
+    sizes = {
+        'train':n_train,
+        'test':n_test,
+        'val':n_val
+    }
+    # 完整数据只加载和划分一次。
+    datasets = load_yahoo_data(seed=seed)
+    seen_idx = {}
+    for split, n in sizes.items():
+        ds = datasets[split]
+        sub = _balanced_subsample(ds, n,seed=seed)
+        sub.to_json(os.path.join(out_dir,f'{split}.jsonl'), force_ascii=False)
+        seen_idx[split] = set(sub['idx'])
+        counts = Counter(sub['label'])
+        assert len(set(counts.values())) == 1, f'{split} not balanced: {counts}'
+        print(split, len(sub),dict(counts))
+    assert not (seen_idx['train'] & seen_idx['val'])
+    assert not (seen_idx['train'] & seen_idx['test'])
+    assert not (seen_idx['val'] & seen_idx['test'])
 
 if __name__ == '__main__':
-    build_yahoo_files(os.path.join(ROOT_DIR, 'data', 'YAHOO'))
+    data_path = os.path.join(ROOT_DIR, "data", "YAHOO")
+    os.makedirs(data_path,exist_ok=True)
+    build_yahoo_files(data_path)
+    # 导出之后只读取抽样后的 JSONL，不再处理完整数据。
+    datasets = load_dataset(
+        'json',
+        data_files={
+            split: os.path.join(data_path, f'{split}.jsonl')
+            for split in ['train', 'val', 'test']
+        },
+        cache_dir=f'{ROOT_DIR}/.cache/huggingface_models/',
+    )
+    dataset_train = datasets['train']
+    dataset_val = datasets['val']
+    dataset_test = datasets['test']
+
+    tokenizer = AutoTokenizer.from_pretrained(os.path.join(ROOT_DIR, r"Llama-3.1-8B-Instruct"))
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "right"
+    tokenizer.model_max_length = 1500
+    tokenizer.chat_template = YAHOO_CHAT_TEMPLATE_LLAMA31
+
+    print(
+        f"\nLength of train set: {len(dataset_train)}, val set: {len(dataset_val)}, "
+        f"test set: {len(dataset_test)}"
+    )
+    for split in ['train','val','test']:
+        print(f'\n\nRendering some {split} examples...')
+        ds = datasets[split]
+        for i in range(2):
+            example = ds[i]
+            messages = example_to_messages(example)
+            rendered = render_chat(messages, tokenizer, add_generation_prompt=False)
+            print(f"\n--- Example {i} ---\n")
+            print(rendered)
+
+        k = min(2, len(ds))
+        batched = ds[:k]
+        batched_messages = example_to_messages(batched)
+        assert len(batched_messages) == k
+        for j in range(k):
+            single = {col:batched[col][j] for col in batched}
+            assert example_to_messages(single) == batched_messages[j]
+        for j, messages in enumerate(batched_messages):
+            rendered = render_chat(messages, tokenizer, add_generation_prompt=False)
+            print(f"\n--- Batched example {j} (split={split}) ---\n")
+            print(rendered)
+
+    # Sanity check: format prompt without the answer.
+    sample = dataset_train[0]
+    prompt = format_prompt(sample, tokenizer, include_answer=False)
+    print("\n--- Prompt Preview ---\n")
+    print(prompt)
+
+    # Sanity check: label extraction.
+    gold_label = extract_label_from_example(sample)
+    parsed_label = extract_answer_letter(example_to_messages(sample)[-1]["content"])
+    assert gold_label in 'ABCDEFGHIJ'
+    assert gold_label == parsed_label
+    print(f"\nGold label: {gold_label}, Parsed label: {parsed_label}")
+
+    # Sanity check: tiny accuracy check.
+    predictions = [gold_label, gold_label]
+    labels = [gold_label, "Z"]
+    print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")
+    assert compute_accuracy(predictions, labels) == 0.5
+    print("YAHOO sanity checks: PASS")
