@@ -7,7 +7,6 @@ from torch import nn
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    TrainerCallback,
 )
 from peft import LoraConfig, get_peft_model
 
@@ -21,7 +20,6 @@ __all__ = [
     'build_base_peft_model',
     'set_seed',
     'print_trainable_parameters',
-    'EvalCallback',
 ]
 
 GENERAL_TEMPLATE = (
@@ -94,8 +92,7 @@ def find_all_linear_names(model)->list:
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            name = name.split(".")
-            module_name = name[0] if len(names)==1 else names[-1]
+            module_name = name.split(".")[-1]
             if module_name != "lm_head":
                 lora_module_names.add(module_name)
     return sorted(lora_module_names)

@@ -1,33 +1,7 @@
-# Python
 __pycache__/
-*.py[cod]
-.venv/
-venv/
-.env
-
-# 数据和训练输出
 data/
-datas/
 outputs/
 results/
-checkpoints/
-*.log
-
-# 模型权重
-*.pt
-*.pth
-*.bin
-*.safetensors
-*.ckpt
-
-# 缓存
-hf_cache/
 .cache/
-.ipynb_checkpoints/
-
-# IDE / 系统文件
-.idea/
-.vscode/
-.DS_Store
-
-Llama-3.1-8B-Instruct/*
+Llama-3.1-8B-Instruct/
+reports/
