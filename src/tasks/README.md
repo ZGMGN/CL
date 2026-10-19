@@ -103,3 +103,13 @@ DBPEDIA uses the same complete-chat 1536-token filter as YAHOO, including
 choices and assistant answers. Rejected candidates are replaced to retain
 1000/125/125 samples per class. `build_dbpedia_files(..., max_length=1536)`
 loads the local Llama tokenizer and never truncates individual samples.
+
+Accuracy is implemented once in `src/metrics.py`. Task modules import and
+re-export `compute_accuracy` for their existing sanity checks; training code
+can use `from src.metrics import compute_accuracy` from the project root.
+
+The Llama template and `render_chat` are shared in `src/model/utils.py`. Task
+modules keep their `<TASK>_CHAT_TEMPLATE_LLAMA31` names as aliases for the shared
+`GENERAL_TEMPLATE`, so existing callers can keep using those names. AGNEWS's
+main sanity check reads existing local JSONL files and the local tokenizer;
+regenerating its data is an explicit call to `build_agnews_files`.

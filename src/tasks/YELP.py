@@ -15,6 +15,10 @@ import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
+from metrics import compute_accuracy
+from model.utils import GENERAL_TEMPLATE, render_chat
+YELP_CHAT_TEMPLATE_LLAMA31 = GENERAL_TEMPLATE
+
 __all__ = [
     "YELP_CHAT_TEMPLATE_LLAMA31",
     "example_to_messages",
@@ -22,19 +26,8 @@ __all__ = [
     "format_prompt",
     "extract_answer_letter",
     "extract_label_from_example",
-    "compute_accuracy"
 ]
 
-YELP_CHAT_TEMPLATE_LLAMA31 = (
-    "{{ bos_token }}"
-    "{% for message in messages %}"
-    "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' "
-    "+ message['content'] | trim + '<|eot_id|>' }}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}"
-    "{% endif %}"
-)
 
 def _build_answer(index:int)->str:
     letters = string.ascii_uppercase[:5]
@@ -81,12 +74,6 @@ def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
         )
     return messages
 
-def render_chat(messages: List[Dict[str,str]],tokenizer, add_generation_prompt=False):
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-    )
 
 def format_prompt(example:Dict[str,Any],tokenizer,include_answer):
     messages = example_to_messages(example)
@@ -128,12 +115,6 @@ def extract_label_from_example(example):
             return extract_answer_letter(msg['content'])
     return None
 
-def compute_accuracy(preds, golds):
-    if len(preds) != len(golds):
-        raise ValueError('长度不一致')
-    if not preds:
-        return 0.0
-    return sum(p == l for p,l in zip(preds,golds))/len(golds)
 
 def load_yelp_data(
     cache_dir = f'{ROOT_DIR}/.cache/huggingface_models/',

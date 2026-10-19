@@ -15,6 +15,10 @@ import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
+from metrics import compute_accuracy
+from model.utils import GENERAL_TEMPLATE, render_chat
+QQP_CHAT_TEMPLATE_LLAMA31 = GENERAL_TEMPLATE
+
 __all__ = [
     "QQP_CHAT_TEMPLATE_LLAMA31",
     "example_to_messages",
@@ -22,19 +26,8 @@ __all__ = [
     "format_prompt",
     "extract_answer_letter",
     "extract_label_from_example",
-    "compute_accuracy"
 ]
 
-QQP_CHAT_TEMPLATE_LLAMA31 = (
-    "{{ bos_token }}"
-    "{% for message in messages %}"
-    "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' "
-    "+ message['content'] | trim + '<|eot_id|>' }}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}"
-    "{% endif %}"
-)
 _prompt_question1 = (
     '###Question1: '
 )
@@ -85,12 +78,6 @@ def example_to_messages(example: Dict[str, Any])-> List[Dict[str, str]]:
         )
     return messages
 
-def render_chat(messages:List[Dict[str,str]], tokenizer, add_generation_prompt:bool = False)->str:
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-    )
 
 def format_prompt(example:Dict[str,Any],tokenizer,include_answer:bool=False)->str:
     messages = example_to_messages(example)
@@ -133,14 +120,6 @@ def extract_label_from_example(example:Dict[str,Any])->Optional[str]:
     return None
 
 
-def compute_accuracy(preds: List[str], labels: List[str]) -> float:
-    if len(preds) != len(labels):
-        raise ValueError("预测数量和标签数量必须一致")
-    if not labels:
-        return 0.0
-
-    correct = sum(p == l for p, l in zip(preds, labels))
-    return correct / len(labels)
 
 def _load_QQP_data(
     split:str = 'train',
@@ -237,7 +216,7 @@ if __name__ == '__main__':
     print(
         f"\nLength of train set: {len(dataset_train)}, val set: {len(dataset_val)}, "
         f"test set: {len(dataset_test)}"
-    )  
+    )
     for split in ['train','val','test']:
         print(f'\n\nRendering some {split} examples...')
         ds = _load_QQP_data(split=split)
@@ -247,7 +226,7 @@ if __name__ == '__main__':
             rendered = render_chat(messages, tokenizer, add_generation_prompt=False)
             print(f"\n--- Example {i} ---\n")
             print(rendered)
-        
+
         k = min(2, len(ds))
         batched = ds[:k]
         batched_messages = example_to_messages(batched)
@@ -274,4 +253,4 @@ if __name__ == '__main__':
     # Sanity check: tiny accuracy check.
     predictions = [gold_label, gold_label]
     labels = [gold_label, "Z"]
-    print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")           
+    print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")

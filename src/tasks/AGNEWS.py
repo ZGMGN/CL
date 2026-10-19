@@ -15,6 +15,11 @@ import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
+
+from metrics import compute_accuracy
+from model.utils import GENERAL_TEMPLATE, render_chat
+AGNEWS_CHAT_TEMPLATE_LLAMA31 = GENERAL_TEMPLATE
+
 __all__ = [
     "AGNEWS_CHAT_TEMPLATE_LLAMA31",
     "example_to_messages",
@@ -22,19 +27,7 @@ __all__ = [
     "format_prompt",
     "extract_answer_letter",
     "extract_label_from_example",
-    "compute_accuracy"
 ]
-
-AGNEWS_CHAT_TEMPLATE_LLAMA31 = (
-    "{{ bos_token }}"
-    "{% for message in messages %}"
-    "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n' "
-    "+ message['content'] | trim + '<|eot_id|>' }}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}"
-    "{% endif %}"
-)
 
 def _build_answer(index:int)->str:
     letters = string.ascii_uppercase
@@ -80,12 +73,6 @@ def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
         )
     return messages
 
-def render_chat(messages: List[Dict[str,str]],tokenizer, add_generation_prompt=False):
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-    )
 
 def format_prompt(example:Dict[str,Any],tokenizer,include_answer):
     messages = example_to_messages(example)
@@ -127,12 +114,6 @@ def extract_label_from_example(example):
             return extract_answer_letter(msg['content'])
     return None
 
-def compute_accuracy(preds, golds):
-    if len(preds) != len(golds):
-        raise ValueError('长度不一致')
-    if not preds:
-        return 0.0
-    return sum(p == l for p,l in zip(preds,golds))/len(golds)
 
 def load_agnews_data(
     split:str = 'train',
@@ -199,12 +180,23 @@ def build_agnews_files(out_dir, n_train=2000, n_val=500, n_test = 500, seed=1):
 if __name__ == '__main__':
     data_path = os.path.join(ROOT_DIR, "data", "AGNEWS")
     os.makedirs(data_path,exist_ok=True)
-    build_agnews_files(data_path)
-    dataset_train = load_agnews_data(split='train')
-    dataset_val = load_agnews_data(split="val")
-    dataset_test = load_agnews_data(split="test")
+    #build_agnews_files(data_path)
+    # 数据已准备好，sanity check 只读取本地 JSONL，不再请求 HF 仓库。
+    datasets = load_dataset(
+        'json',
+        data_files={
+            split: os.path.join(data_path, f'{split}.jsonl')
+            for split in ['train', 'val', 'test']
+        },
+        cache_dir=f'{ROOT_DIR}/.cache/huggingface_models/',
+    )
+    dataset_train = datasets['train']
+    dataset_val = datasets['val']
+    dataset_test = datasets['test']
 
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(ROOT_DIR, r"Llama-3.1-8B-Instruct"))
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(ROOT_DIR, r"Llama-3.1-8B-Instruct"), local_files_only=True,
+    )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "right"
@@ -214,17 +206,17 @@ if __name__ == '__main__':
     print(
         f"\nLength of train set: {len(dataset_train)}, val set: {len(dataset_val)}, "
         f"test set: {len(dataset_test)}"
-    )  
+    )
     for split in ['train','val','test']:
         print(f'\n\nRendering some {split} examples...')
-        ds = load_agnews_data(split=split)
+        ds = datasets[split]
         for i in range(2):
             example = ds[i]
             messages = example_to_messages(example)
             rendered = render_chat(messages, tokenizer, add_generation_prompt=False)
             print(f"\n--- Example {i} ---\n")
             print(rendered)
-        
+
         k = min(2, len(ds))
         batched = ds[:k]
         batched_messages = example_to_messages(batched)
@@ -251,4 +243,4 @@ if __name__ == '__main__':
     # Sanity check: tiny accuracy check.
     predictions = [gold_label, gold_label]
     labels = [gold_label, "Z"]
-    print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")   
+    print(f"\nTiny accuracy check (expect 0.5): {compute_accuracy(predictions, labels)}")
