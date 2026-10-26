@@ -13,7 +13,7 @@ import torch
 from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
-TASKS = ('SST2', 'AGNEWS', 'AMAZON', 'YELP', 'DBPEDIA', 'YAHOO')
+TASKS = ('SST2', 'AGNEWS', 'AMAZON', 'YELP', 'DBPEDIA', 'YAHOO', 'QQP')
 
 
 class FakeModel(torch.nn.Module):

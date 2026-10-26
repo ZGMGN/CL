@@ -30,15 +30,15 @@ using uppercase task names. Re-running replaces that task's existing files.
 Like the existing tasks, each module sets `HF_ENDPOINT` to
 `https://hf-mirror.com`. Downloads require network access and sufficient local storage.
 
-Sample sizes are **per class**. Amazon uses 1600/400/400; the other
-new tasks use 2000/500/500 by default:
+Sample sizes are **per class**. AMAZON and YELP use 1600/400/400;
+DBPEDIA uses 1000/125/125, and YAHOO uses 1000/200/200:
 
 | Task | Train total | Validation total | Test total |
 | --- | ---: | ---: | ---: |
 | AMAZON | 8000 | 2000 | 2000 |
-| YELP | 10000 | 2500 | 2500 |
-| DBPEDIA | 28000 | 7000 | 7000 |
-| YAHOO | 20000 | 5000 | 5000 |
+| YELP | 8000 | 2000 | 2000 |
+| DBPEDIA | 14000 | 1750 | 1750 |
+| YAHOO | 10000 | 2000 | 2000 |
 
 Each module follows the AGNEWS / QQP / SST2 file structure: explicit prompt
 strings, `_single_example_to_message`, `example_to_messages`, `render_chat`,
@@ -84,13 +84,13 @@ DBpedia follows the same reuse pattern: `load_dbpedia_data(seed=1)` returns
 `{"train": train_set, "val": val_set, "test": test_set}` without a `split`
 parameter. `build_dbpedia_files` calls it once, and the main block reads the
 exported JSONL once for the remaining checks. Its per-class defaults remain
-2000/500/500.
+1000/125/125.
 
 YAHOO and YELP also return dictionaries from `load_yahoo_data(seed=1)` and
 `load_yelp_data(seed=1)`. Neither accepts a `split` parameter. Their builders
 load and split the source once, and their main blocks reuse the exported JSONL
 for all checks. Yahoo still renames `topic` to `label`; both tasks keep their
-2000/500/500 per-class sampling defaults.
+1000/200/200 (YAHOO) and 1600/400/400 (YELP) per-class sampling defaults.
 
 YAHOO exports only samples whose complete Llama training conversation (template,
 input fields, choices and assistant answer) is at most 1536 tokens. The builder
@@ -105,7 +105,7 @@ choices and assistant answers. Rejected candidates are replaced to retain
 loads the local Llama tokenizer and never truncates individual samples.
 
 Accuracy is implemented once in `src/metrics.py`. Task modules import and
-re-export `compute_accuracy` for their existing sanity checks; training code
+use `compute_accuracy` for their existing sanity checks; training code
 can use `from src.metrics import compute_accuracy` from the project root.
 
 The Llama template and `render_chat` are shared in `src/model/utils.py`. Task
@@ -113,3 +113,7 @@ modules keep their `<TASK>_CHAT_TEMPLATE_LLAMA31` names as aliases for the share
 `GENERAL_TEMPLATE`, so existing callers can keep using those names. AGNEWS's
 main sanity check reads existing local JSONL files and the local tokenizer;
 regenerating its data is an explicit call to `build_agnews_files`.
+
+Full generation evaluation uses the local exported test JSONL and is separate
+from these data preparation sanity checks. See the [project README](../../README.md)
+for the six evaluation scripts, ordinary LoRA loading, output fields and baseline results.
