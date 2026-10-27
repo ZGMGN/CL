@@ -244,38 +244,183 @@ def persist_adjacent_results(output_dir, metadata, rows):
                 writer.writerow({**{key: row[key] for key in fields[:5]}, 'layer': layer, **values})
 
 
-def plot_adjacent_comparisons(rows, output_dir):
+def plot_adjacent_comparisons(rows, output_dir, run_dir=None):
+    """Readable two-page report: accuracy changes, then representation/function drift."""
     if not rows:
         return
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    metrics = [
-        ('accuracy_before', 'Accuracy before (%)', 0, 100, 100),
-        ('accuracy_after', 'Accuracy after (%)', 0, 100, 100),
-        ('accuracy_change_pp', 'Accuracy change (pp)', None, None, 1),
-        ('cka', 'Linear CKA', 0, 1, 1),
-        ('rep_drift', 'Representation cosine drift', 0, 2, 1),
-        ('func_drift', 'Symmetric KL (nats)', 0, None, 1),
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.lines import Line2D
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    count = len(rows)
+    positions = np.arange(count)
+    stage_tasks = {row['after_stage']: row['trained_task'] for row in rows}
+    stage_order = [stage_tasks[index] for index in sorted(stage_tasks)]
+    palette = {'YAHOO': '#2563eb', 'AMAZON': '#d97706', 'AGNEWS': '#7c3aed',
+               'DBPEDIA': '#059669', 'YELP': '#dc2626', 'SST2': '#0891b2', 'QQP': '#9333ea'}
+    colors = [palette.get(row['evaluated_task'], '#475569') for row in rows]
+
+    def model_label(index):
+        return 'M0 (Base)' if index == 0 else f'M{index} (after {stage_tasks[index]})'
+
+    labels = [f"{model_label(row['before_stage'])} → {model_label(row['after_stage'])}\nTest data: {row['evaluated_task']}" for row in rows]
+    validation_labels = [f"{model_label(row['before_stage'])} ↔ {model_label(row['after_stage'])}\nValidation data: {row['evaluated_task']}" for row in rows]
+    task_legend = [Line2D([], [], marker='o', linestyle='none', color=palette.get(task, '#475569'),
+                          label=f'Data: {task}', markersize=7) for task in stage_order]
+    order_label = 'Training order: ' + '  →  '.join(stage_order)
+    height = max(5.5, 0.85 * count + 2.3)
+    legend = [
+        Line2D([], [], marker='o', linestyle='none', markerfacecolor='white', markeredgecolor='#64748b', label='Earlier model: open circle', markersize=7),
+        Line2D([], [], marker='o', linestyle='none', color='#334155', label='Later model: filled circle', markersize=7),
     ]
-    fig, axes = plt.subplots(1, len(metrics), figsize=(17, max(4, len(rows) * 0.6 + 2)), sharey=True)
-    labels = [f"{row['after_stage']:02d} Train {row['trained_task']} | {row['task_role']}: {row['evaluated_task']}" for row in rows]
-    for ax, (key, label, low, high, scale) in zip(axes, metrics):
-        values = np.array([np.nan if row[key] is None else scale * row[key] for row in rows]).reshape(-1, 1)
-        if key == 'accuracy_change_pp':
-            limit = max(1.0, float(np.nanmax(np.abs(values))))
-            low, high = -limit, limit
-        im = ax.imshow(np.ma.masked_invalid(values), aspect='auto', cmap='coolwarm', vmin=low, vmax=high)
-        ax.set_xticks([0], [label], rotation=45, ha='right')
-        ax.set_yticks(range(len(rows)), labels)
-        for index, value in enumerate(values[:, 0]):
-            ax.text(0, index, 'N/A' if np.isnan(value) else f'{value:.3f}', ha='center', va='center', fontsize=8)
-        fig.colorbar(im, ax=ax, shrink=0.7)
-    fig.suptitle('Before/after training: current task and immediately previous task')
-    fig.tight_layout()
-    fig.savefig(output_dir / 'adjacent_task_metrics.png', dpi=200)
-    fig.savefig(output_dir / 'adjacent_task_metrics.pdf')
-    plt.close(fig)
+    style = {'font.size': 11, 'axes.titlesize': 13, 'axes.labelsize': 11,
+             'xtick.labelsize': 10, 'ytick.labelsize': 10, 'pdf.fonttype': 42}
+
+    def decorate(ax, show_labels, split='test'):
+        begin = 0
+        for index in range(1, count + 1):
+            if index == count or rows[index]['after_stage'] != rows[begin]['after_stage']:
+                if rows[begin]['after_stage'] % 2 == 0:
+                    ax.axhspan(begin - 0.5, index - 0.5, color='#f1f5f9', zorder=0)
+                if index < count:
+                    ax.axhline(index - 0.5, color='#cbd5e1', linewidth=0.9, zorder=0)
+                begin = index
+        ax.set_ylim(count - 0.5, -0.5)
+        ax.set_yticks(positions, labels if split == 'test' else validation_labels)
+        ax.tick_params(axis='y', length=0, pad=12, labelleft=show_labels)
+        ax.set_axisbelow(True)
+        ax.grid(axis='x', color='#e2e8f0', linewidth=0.8)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    with plt.rc_context(style):
+        accuracy_fig, (accuracy_ax, change_ax) = plt.subplots(
+            1, 2, figsize=(16, height), gridspec_kw={'width_ratios': [2.4, 1.25]}, sharey=True
+        )
+        accuracy_fig.subplots_adjust(left=0.34, right=0.98, bottom=0.14, top=0.72, wspace=0.22)
+        accuracy_fig.suptitle('Test accuracy: explicit model pairs and evaluation tasks', fontsize=17, x=0.50, y=0.975)
+        accuracy_fig.text(0.5, 0.93, order_label, ha='center', color='#475569', fontsize=11)
+        accuracy_fig.legend(handles=legend, loc='upper center', bbox_to_anchor=(0.65, 0.90), ncol=2, frameon=False, fontsize=10)
+        accuracy_fig.legend(handles=task_legend, loc='upper center', bbox_to_anchor=(0.65, 0.85), ncol=min(4, len(task_legend)), frameon=False, fontsize=10)
+        before = np.array([row['accuracy_before'] * 100 for row in rows])
+        after = np.array([row['accuracy_after'] * 100 for row in rows])
+        change = np.array([row['accuracy_change_pp'] for row in rows])
+        accuracy_ax.set_title('Earlier model vs later model', loc='left', pad=17)
+        accuracy_ax.text(106, -0.85, 'Earlier → Later', color='#475569', fontsize=10, clip_on=False)
+        accuracy_ax.hlines(positions, before, after, color='#94a3b8', linewidth=3, zorder=2)
+        accuracy_ax.scatter(before, positions, facecolors='white', edgecolors='#64748b', s=66, linewidths=1.5, zorder=3)
+        accuracy_ax.scatter(after, positions, c=colors, s=66, zorder=4)
+        for index, (old, new) in enumerate(zip(before, after)):
+            accuracy_ax.text(106, index, f'{old:.2f} → {new:.2f}', va='center', fontsize=11, color='#0f172a')
+        accuracy_ax.set_xlim(0, 144)
+        accuracy_ax.set_xticks([0, 25, 50, 75, 100])
+        accuracy_ax.set_xlabel('Accuracy (%)')
+        decorate(accuracy_ax, True)
+        limit = max(5.0, float(np.max(np.abs(change))) * 1.3)
+        change_colors = ['#0f766e' if value >= 0 else '#dc2626' for value in change]
+        change_ax.barh(positions, change, color=change_colors, height=0.38, zorder=2)
+        change_ax.axvline(0, color='#64748b', linewidth=1.2, zorder=1)
+        for index, value in enumerate(change):
+            change_ax.text(value + (limit * 0.035 if value >= 0 else -limit * 0.035), index,
+                           f'{value:+.2f}', ha='left' if value >= 0 else 'right', va='center',
+                           color=change_colors[index], fontsize=11, fontweight='bold')
+        change_ax.set_xlim(-limit, limit)
+        change_ax.set_title('Accuracy change', loc='left', pad=17)
+        change_ax.set_xlabel('Percentage points (after - before)')
+        decorate(change_ax, False)
+        accuracy_fig.text(0.34, 0.045, 'M0 = base. Mj = base + the saved cumulative stage-j adapter. Exact adapter mapping is on page 3.',
+                          fontsize=10, color='#475569')
+
+        drift_fig, axes = plt.subplots(1, 3, figsize=(16, height + 0.8), sharey=True)
+        drift_fig.subplots_adjust(left=0.34, right=0.98, bottom=0.15, top=0.72, wspace=0.30)
+        drift_fig.suptitle('Model-pair similarity and drift on the named validation task', fontsize=16, y=0.975)
+        drift_fig.text(0.5, 0.93, order_label, ha='center', color='#475569', fontsize=11)
+        drift_fig.legend(handles=task_legend, loc='upper center', bbox_to_anchor=(0.66, 0.88),
+                         ncol=min(4, len(task_legend)), frameon=False, fontsize=10)
+        specifications = [
+            ('cka', 'Linear CKA', 'Higher = more similar', 'Similarity', 1.10),
+            ('rep_drift', 'Representation cosine drift', 'Higher = more change', 'Cosine distance (observed range)', None),
+            ('func_drift', 'Output distribution drift', 'Higher = more change', 'Symmetric KL (nats)', None),
+        ]
+        for column, (ax, (key, title, direction, xlabel, fixed_limit)) in enumerate(zip(axes, specifications)):
+            values = np.array([np.nan if row[key] is None else row[key] for row in rows], dtype=float)
+            finite = np.isfinite(values)
+            observed = float(np.max(values[finite])) if finite.any() else 0.0
+            upper = fixed_limit if fixed_limit is not None else max(0.05, observed * 1.28)
+            ax.set_xlim(0, upper)
+            for index, value in enumerate(values):
+                if not np.isfinite(value):
+                    ax.text(upper * 0.04, index, 'N/A', va='center', color='#64748b')
+                    continue
+                ax.barh(index, value, color=colors[index], alpha=0.15, height=0.38, zorder=1)
+                ax.scatter(value, index, color=colors[index], s=52, zorder=3)
+                ax.text(value + upper * 0.035, index, f'{value:.3f}', va='center', fontsize=11, color='#0f172a')
+            ax.set_title(title + '\n' + direction, loc='left', pad=14, fontsize=12, linespacing=1.4)
+            ax.set_xlabel(xlabel)
+            if key == 'cka':
+                ax.set_xticks([0, 0.25, 0.50, 0.75, 1.0])
+            decorate(ax, column == 0, split='validation')
+        layers = sorted(set(row['summary_layer'] for row in rows))
+        counts = sorted(set(row['probe_count'] for row in rows))
+        drift_fig.text(0.34, 0.055, f"Hidden-state layer: {', '.join(map(str, layers))} | Validation probes/task: {', '.join(map(str, counts))}",
+                       fontsize=10, color='#475569')
+        drift_fig.text(0.34, 0.025, 'Same validation examples within each model pair. KL uses the first answer token. All adapters are cumulative; see page 3.',
+                       fontsize=9.5, color='#475569')
+
+        model_mapping = [{'model': 'M0', 'cumulative_tasks': [], 'adapter_dir': None}]
+        for index in sorted(stage_tasks):
+            relative = f'{index:02d}_{stage_tasks[index]}/best_model'
+            model_mapping.append({
+                'model': f'M{index}', 'cumulative_tasks': [stage_tasks[i] for i in sorted(stage_tasks) if i <= index],
+                'adapter_dir': str((Path(run_dir) / relative).resolve()) if run_dir is not None else relative,
+            })
+        save_json(output_dir / 'model_adapter_mapping.json', {
+            'base_model': str(ROOT_DIR / 'Llama-3.1-8B-Instruct'),
+            'run_dir': None if run_dir is None else str(Path(run_dir).resolve()),
+            'models': model_mapping,
+            'comparison': 'Each row names two models and a single fixed evaluation task; Mj uses the saved cumulative stage-j adapter.',
+        })
+        with (output_dir / 'model_adapter_mapping.csv').open('w', newline='', encoding='utf-8') as stream:
+            writer = csv.DictWriter(stream, fieldnames=['model', 'cumulative_tasks', 'adapter_dir'])
+            writer.writeheader()
+            writer.writerows([{**item, 'cumulative_tasks': ' → '.join(item['cumulative_tasks'])} for item in model_mapping])
+        mapping_fig, mapping_ax = plt.subplots(figsize=(16, max(5.6, len(model_mapping) * 0.7 + 2)))
+        mapping_ax.axis('off')
+        mapping_fig.suptitle('Which model and adapter does each identifier mean?', fontsize=18, y=0.96)
+        mapping_fig.text(0.08, 0.85, 'All models share the same base weights. Each saved adapter includes the full training history shown below.', fontsize=12)
+        table_rows = [['M0', 'No task training (base model)', 'No adapter']]
+        for index in sorted(stage_tasks):
+            table_rows.append([f'M{index}', ' → '.join(stage_tasks[i] for i in sorted(stage_tasks) if i <= index),
+                               f'{index:02d}_{stage_tasks[index]}/best_model'])
+        table = mapping_ax.table(cellText=table_rows,
+            colLabels=['Model', 'Training completed (cumulative)', 'Saved adapter / relative path'],
+            cellLoc='left', colLoc='left', colWidths=[0.09, 0.49, 0.42], bbox=[0.02, 0.20, 0.96, 0.56])
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        for (row_index, _), cell in table.get_celld().items():
+            cell.set_edgecolor('#cbd5e1')
+            cell.set_facecolor('#e2e8f0' if row_index == 0 else ('#f8fafc' if row_index % 2 else 'white'))
+            if row_index == 0:
+                cell.set_text_props(weight='bold')
+        mapping_fig.text(0.08, 0.13, 'Example: M1 ↔ M2, Validation data: YAHOO compares both models on exactly the same YAHOO prompts.', fontsize=11)
+        mapping_fig.text(0.08, 0.075, 'Full paths and cumulative task lists are saved in model_adapter_mapping.json and .csv.', fontsize=10, color='#475569')
+        mapping_fig.savefig(output_dir / 'model_adapter_mapping.png', dpi=220)
+
+        accuracy_fig.savefig(output_dir / 'adjacent_task_metrics.png', dpi=220)
+        accuracy_fig.savefig(output_dir / 'adjacent_accuracy_metrics.pdf')
+        drift_fig.savefig(output_dir / 'adjacent_representation_metrics.png', dpi=220)
+        drift_fig.savefig(output_dir / 'adjacent_representation_metrics.pdf')
+        with PdfPages(output_dir / 'adjacent_task_metrics.pdf') as pdf:
+            pdf.savefig(accuracy_fig)
+            pdf.savefig(drift_fig)
+            pdf.savefig(mapping_fig)
+        plt.close(accuracy_fig)
+        plt.close(drift_fig)
+        plt.close(mapping_fig)
 
 
 def plot_transitions(rows, output_dir):
@@ -463,7 +608,7 @@ def run_evaluation(args):
     plot_model_matrices(matrices, output_dir)
     metadata['complete'] = True
     persist_adjacent_results(output_dir, metadata, adjacent_rows)
-    plot_adjacent_comparisons(adjacent_rows, output_dir)
+    plot_adjacent_comparisons(adjacent_rows, output_dir, run_dir=args.run_dir)
     persist_results(output_dir, metadata, rows)
     plot_transitions(rows, output_dir)
     print(f'Completed {len(rows)} transitions: {output_dir}', flush=True)
