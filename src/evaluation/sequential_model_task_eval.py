@@ -22,6 +22,10 @@ sys.path.insert(0, str(ROOT_DIR / 'src'))
 
 from evaluation import sequential_drift_eval as drift
 from evaluation import sequential_heatmap_eval as heatmap
+from evaluation.sequential_metric_explanations import calculation_markdown, plot_calculation_pages
+from evaluation.sequential_layer_report import persist_layer_results, layer_analysis_markdown, plot_layer_pages
+from evaluation.sequential_pooling_report import persist_pooling_comparison, load_mean_results, plot_mean_pages
+from evaluation.sequential_directional_kl_report import persist_directional_kl, directional_kl_markdown, plot_directional_kl_pages
 from evaluation.drift_metrics import distribution_drift, linear_cka, representation_cosine_drift
 from evaluation.general_task_eval import build_eval_model
 from model.utils import GENERAL_TEMPLATE, MODEL_DIR, set_seed
@@ -264,12 +268,16 @@ def persist_task_learned_reference(payload, output_dir):
     write_csv(output_dir / 'all_model_task_metrics.csv', payload['model_task_results'])
 
 
-def refresh_reports(output_dir):
+def refresh_reports(output_dir, mean_results_dir=None):
     """Rebuild derived comparisons and figures without loading datasets or models."""
     payload = json.loads((output_dir / 'all_model_task_metrics.json').read_text())
     if not payload.get('complete'):
         raise ValueError('Report-only mode requires complete model-pair metrics')
+    if mean_results_dir is not None:
+        payload['mean_pooling_results_dir'] = str(Path(mean_results_dir).resolve())
+    persist_layer_results(payload, output_dir)
     persist_task_learned_reference(payload, output_dir)
+    persist_directional_kl(payload, output_dir)
     write_analysis(payload, output_dir)
     plot_report(payload, output_dir)
     print(f'Updated task-trained reference reports: {output_dir}', flush=True)
@@ -309,34 +317,47 @@ def write_analysis(payload, output_dir):
                 return 'N/A' if value is None else f'{value:.4f}'
             lines.append(f"最终模型 {labels[-1]} 与{ name } {labels[reference]}，在同一 {task} 验证集样本上的比较："
                          f"CKA={number(pair['cka'][task][reference][-1])}，"
-                         f"表征 cosine drift={number(pair['rep_drift'][task][reference][-1])}，"
+                         f"Representation drift={number(pair['rep_drift'][task][reference][-1])}，"
+                         f"KL({labels[reference]} || {labels[-1]})={payload['directional_kl_matrices'][task][reference][-1]:.4f}，"
+                         f"KL({labels[-1]} || {labels[reference]})={payload['directional_kl_matrices'][task][-1][reference]:.4f}，"
                          f"symmetric KL={number(pair['symmetric_kl'][task][reference][-1])} nats。")
         lines += ['', f'以 {task} 刚训练完成的模型 {labels[learned]} 为参照的全阶段比较：', '',
-                  '| 被比较模型 | 相对参照阶段 | 准确率变化（百分点） | CKA | 表征漂移 | symmetric KL（nats） |',
-                  '| --- | --- | --- | --- | --- | --- |']
+                  '| 被比较模型 M | 相对参照阶段 | 准确率变化（百分点） | CKA | 表征漂移 | KL(R ‖ M) | KL(M ‖ R) | symmetric KL（nats） |',
+                  '| --- | --- | --- | --- | --- | --- | --- | --- |']
         phases = {'before_task_training': '该任务训练前对照', 'task_just_learned': '参照模型自身', 'after_task_training': '该任务训练后'}
         for result in payload['task_learned_reference_results']:
             if result['evaluated_task'] != task:
                 continue
             lines.append(f"| {result['model']} | {phases[result['comparison_phase']]} | {result['test_accuracy_change_vs_task_learned_pp']:+.2f} | "
-                         f"{number(result['cka_vs_task_learned'])} | {number(result['rep_drift_vs_task_learned'])} | {number(result['symmetric_kl_vs_task_learned'])} |")
-        lines += ['', '准确率变化 = 被比较模型减参照模型；参照之前的模型仅作训练前对照，不将差值解释为遗忘。', '']
+                         f"{number(result['cka_vs_task_learned'])} | {number(result['rep_drift_vs_task_learned'])} | "
+                         f"{result['kl_reference_to_model']:.4f} | {result['kl_model_to_reference']:.4f} | {number(result['symmetric_kl_vs_task_learned'])} |")
+        lines += ['', f'本表 R={labels[learned]}，M 为行中被比较模型。两个 KL 方向均使用该任务相同的验证样本，单位 nats。', '准确率变化 = 被比较模型减参照模型；参照之前的模型仅作训练前对照，不将差值解释为遗忘。', '']
     lines += ['## 计算口径', '',
               f"- 测试准确率复用完整测试集矩阵：`{payload['accuracy_source']}`。",
               f"- CKA/表征漂移汇总使用 hidden_states[{payload['summary_layer']}]，pooling={payload['settings']['pooling']}；逐层结果另存 CSV。",
               '- 对同一任务，所有模型使用完全相同的验证样本、顺序、提示和截断设置；样本索引与 hash 见 probe_manifest.json。',
               '- KL 对相同提示的首个答案位置、整个词表计算；symmetric KL 为正反 KL 的平均值。',
-              '- CKA 和 cosine drift 是两个模型之间的指标，并非某个模型单独的分数。原 5×4 总览与 M0 比较；新增总览每列以该任务刚训练后的 Mi 为参照；5×5 图显示所有模型对。',
+              '- CKA 和 Representation drift 是两个模型之间的指标，并非某个模型单独的分数。原 5×4 总览与 M0 比较；新增总览每列以该任务刚训练后的 Mi 为参照；5×5 图显示所有模型对。',
               '- 未学任务、已学任务均纳入评估；高 CKA 不直接代表准确率高或没有遗忘。',
               '- 验证样本数量沿用已有设置，并未因为增加模型对而增加独立样本数；这些是点估计，未给出置信区间。',
               '- 梯度 cosine 与 LoRA 更新 cosine 描述任务梯度/训练更新方向，仍在原 transition 报告中，不冒充单模型任务指标。', '']
+    layer_notes = layer_analysis_markdown(payload)
+    if layer_notes:
+        lines += [layer_notes]
+    _, mean_notes = persist_pooling_comparison(payload, output_dir)
+    if mean_notes:
+        lines += [mean_notes]
+    lines += [directional_kl_markdown(payload)]
+    methods = calculation_markdown(payload)
+    (output_dir / 'metric_calculations.md').write_text(methods + '\n', encoding='utf-8')
+    lines += [methods]
     (output_dir / 'analysis.md').write_text('\n'.join(lines), encoding='utf-8')
 
 
 def run_evaluation(args):
     if args.report_only:
         destination = Path(args.output_dir).resolve() if args.output_dir else Path(args.run_dir).resolve() / 'evaluation_all_models'
-        return refresh_reports(destination)
+        return refresh_reports(destination, args.mean_results_dir)
     if min(args.batch_size, args.eval_batch_size, args.max_input_length, args.max_new_tokens, args.cpu_threads) <= 0 or args.probe_samples < 3:
         raise ValueError('Positive limits and at least three validation probes are required')
     torch.set_num_threads(args.cpu_threads)
@@ -354,7 +375,8 @@ def run_evaluation(args):
         source = json.loads(source_metadata.read_text())
         if source['tasks'] != tasks or not source.get('complete'):
             raise ValueError('Source evaluation must be complete and have the same task order')
-        for key in ('pooling', 'max_input_length', 'seed'):
+        # Source metadata fixes samples/preprocessing; pooling may change in a new cache.
+        for key in ('max_input_length', 'seed'):
             if source['settings'][key] != getattr(args, key):
                 raise ValueError(f'Source evaluation differs for {key}; pass matching settings')
     if not args.accuracy_matrix:
@@ -379,12 +401,16 @@ def run_evaluation(args):
         'pairwise_matrices': matrices, 'layer_cka_matrices': layer_matrices,
         'model_task_results': model_rows, 'pairwise_results': pair_rows,
     }
+    if args.mean_results_dir:
+        payload['mean_pooling_results_dir'] = str(Path(args.mean_results_dir).resolve())
     drift.save_json(output_dir / 'all_model_task_metrics.json', payload)
     drift.save_json(output_dir / 'model_adapter_mapping.json', {'models': models})
     write_csv(output_dir / 'all_model_task_metrics.csv', model_rows)
     write_csv(output_dir / 'all_model_pair_metrics.csv', pair_rows)
     write_csv(output_dir / 'all_model_pair_layer_metrics.csv', layer_rows)
+    persist_layer_results(payload, output_dir)
     persist_task_learned_reference(payload, output_dir)
+    persist_directional_kl(payload, output_dir)
     write_analysis(payload, output_dir)
     plot_report(payload, output_dir)
     drift.save_json(output_dir / 'status.json', {'state': 'complete', 'model_task_count': len(model_rows), 'model_pair_task_count': len(pair_rows)})
@@ -396,6 +422,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run_dir', required=True)
     parser.add_argument('--tasks')
+    parser.add_argument('--mean_results_dir', help='Append this complete mean-pooling evaluation after the last-pooling analysis')
     parser.add_argument('--report_only', action='store_true', help='Rebuild reports from complete metric JSON; no model loading or inference')
     parser.add_argument('--output_dir')
     parser.add_argument('--source_eval_dir', help='Reuse this evaluation\'s exact validation probe manifest')
@@ -456,7 +483,7 @@ def plot_report(payload, output_dir):
         fig.savefig(output_dir / f'{name}.pdf')
         figures.append(fig)
 
-    with plt.rc_context({'font.size': 11, 'pdf.fonttype': 42, 'axes.spines.top': False, 'axes.spines.right': False}):
+    with plt.rc_context({'font.size': 11, 'pdf.fonttype': 42, 'axes.spines.top': False, 'axes.spines.right': False, 'figure.max_open_warning': 0}):
         fig, ax = plt.subplots(figsize=(16, 9))
         ax.axis('off')
         fig.suptitle('All models on every task: evaluation guide', fontsize=21, y=0.95)
@@ -478,9 +505,10 @@ def plot_report(payload, output_dir):
             'Validation probes per task: ' + ', '.join(f'{task}={counts[task]}' for task in tasks),
             f"Representations: hidden_states[{summary_layer}], pooling={payload['settings']['pooling']}; same examples for both models.",
             'Base overview: row model vs M0. Task-trained overview: row model vs the reference named in its column.',
-            'CKA: higher = more similar. Cosine drift / symmetric KL: lower = more similar. Gray = undefined.',
+            'CKA: higher = more similar. Representation drift = mean cosine distance; lower = more similar.',
             'KL: full vocabulary at the first answer position; symmetric KL = half the sum of both directions.',
             'Model IDs always refer to cumulative adapters, rather than independently trained task-only models.',
+            'Report order: LAST pooling, then MEAN pooling (layers 16/32), then directed KL and calculation methods.' if payload.get('mean_pooling_results_dir') else f"Pooling scheme: {payload['settings']['pooling'].upper()}",
         ]
         for index, text in enumerate(lines):
             fig.text(0.07, 0.43 - index * 0.042, text, fontsize=11)
@@ -493,12 +521,12 @@ def plot_report(payload, output_dir):
         grid(axes[0, 0], accuracy, tasks, labels, 'Complete test accuracy (%)', upper=100, fmt='.2f')
         for ax, key, title, upper in (
             (axes[0, 1], 'cka', f'CKA: row model vs M0 | layer {summary_layer}', 1),
-            (axes[1, 0], 'rep_drift', f'Cosine drift: row model vs M0 | layer {summary_layer}', None),
+            (axes[1, 0], 'rep_drift', f'Representation drift | layer {summary_layer}\nRow model vs M0', None),
             (axes[1, 1], 'symmetric_kl', 'Symmetric KL: row model vs M0 (nats)', None),
         ):
             values = [[pairs[key][task][0][stage] for task in tasks] for stage in stages]
             grid(ax, values, tasks, labels, title, upper=upper)
-        fig.text(0.17, 0.025, 'Columns identify the data task. Accuracy uses test data; CKA/drift/KL use aligned validation probes. See guide for exact adapters.', fontsize=10)
+        fig.text(0.17, 0.025, 'Columns identify the data task. Accuracy uses test data; CKA/drift/KL use aligned validation probes. Representation drift = mean cosine distance.', fontsize=10)
         page(fig, 'all_model_task_overview')
 
         reference_labels = [f"{item['evaluated_task']}\nref: {item['reference_label']}" for item in payload['task_learned_references']]
@@ -511,12 +539,12 @@ def plot_report(payload, output_dir):
              'Test accuracy change: row model minus task reference (pp)', cmap='RdBu', signed=True, fmt='+.2f')
         for ax, key, title, upper in (
             (axes[0, 1], 'cka', f'CKA: row model vs task reference | layer {summary_layer}', 1),
-            (axes[1, 0], 'rep_drift', f'Cosine drift: row model vs task reference | layer {summary_layer}', None),
+            (axes[1, 0], 'rep_drift', f'Representation drift | layer {summary_layer}\nRow model vs task reference', None),
             (axes[1, 1], 'symmetric_kl', 'Symmetric KL: row model vs task reference (nats)', None),
         ):
             values = [[pairs[key][task][index + 1][stage] for index, task in enumerate(tasks)] for stage in stages]
             grid(ax, values, reference_labels, labels, title, upper=upper)
-        fig.text(0.17, 0.065, 'Each column names its evaluation task and exact reference model. CKA/drift/KL use identical validation prompts.', fontsize=11)
+        fig.text(0.17, 0.065, 'Columns name the task and reference. Representation drift = mean cosine distance; all comparisons use aligned probes.', fontsize=11)
         fig.text(0.17, 0.035, 'Models before the reference stage are pre-training controls. Only stages after the reference measure subsequent retention/forgetting.', fontsize=10)
         page(fig, 'task_learned_reference_overview')
 
@@ -551,13 +579,13 @@ def plot_report(payload, output_dir):
             fig.text(0.5, 0.89, f'Same {counts[task]} prompts for every model | hidden-state layer {summary_layer}', ha='center', fontsize=12)
             for ax, key, title, upper in (
                 (axes[0], 'cka', 'Linear CKA (higher = similar)', 1),
-                (axes[1], 'rep_drift', 'Cosine drift (lower = similar)', None),
+                (axes[1], 'rep_drift', 'Representation drift (lower = similar)', None),
                 (axes[2], 'symmetric_kl', 'Symmetric KL, nats (lower = similar)', None),
             ):
                 grid(ax, pairs[key][task], short, labels, title, upper=upper)
                 ax.set_xlabel('Second model (see guide for exact adapter)')
             axes[0].set_ylabel('First model')
-            fig.text(0.10, 0.045, 'Each cell compares its row model and column model on this task only. Diagonal = self-comparison; matrices are symmetric.', fontsize=11)
+            fig.text(0.10, 0.045, 'Same-task row/column model comparison. Representation drift = mean cosine distance. Diagonal = self-comparison.', fontsize=11)
             page(fig, f'pairwise_{task}')
 
         fig, axes = plt.subplots(row_count, columns, figsize=(18, max(6, row_count * 4.7)), squeeze=False)
@@ -602,10 +630,32 @@ def plot_report(payload, output_dir):
         fig.text(0.14, 0.025, 'Reference changes with the named validation task. Same task/layer for both models; gray = undefined CKA.', fontsize=10)
         page(fig, 'task_learned_reference_layerwise_cka')
 
+        for layer_fig, name in plot_layer_pages(payload, grid):
+            page(layer_fig, name)
+
+        if payload.get('mean_pooling_results_dir'):
+            mean_payload = load_mean_results(payload, output_dir, payload['mean_pooling_results_dir'])
+            for mean_fig, name in plot_mean_pages(payload, mean_payload, grid):
+                page(mean_fig, name)
+
+        for kl_fig, name in plot_directional_kl_pages(payload, grid):
+            page(kl_fig, name)
+
+        method_figures = plot_calculation_pages(payload, output_dir, ROOT_DIR / '.cache/fonts/NotoSansCJKsc-Regular.otf')
+        with PdfPages(output_dir / 'metric_calculations.pdf') as methods_pdf:
+            for fig in method_figures:
+                methods_pdf.savefig(fig)
+
         with PdfPages(output_dir / 'all_model_task_report.pdf') as pdf:
             for fig in figures:
                 pdf.savefig(fig)
                 plt.close(fig)
+                fig.clear()
+            figures.clear()
+            for fig in method_figures:
+                pdf.savefig(fig)
+                plt.close(fig)
+                fig.clear()
 
 
 if __name__ == '__main__':

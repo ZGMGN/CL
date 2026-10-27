@@ -343,7 +343,7 @@ def plot_adjacent_comparisons(rows, output_dir, run_dir=None):
                          ncol=min(4, len(task_legend)), frameon=False, fontsize=10)
         specifications = [
             ('cka', 'Linear CKA', 'Higher = more similar', 'Similarity', 1.10),
-            ('rep_drift', 'Representation cosine drift', 'Higher = more change', 'Cosine distance (observed range)', None),
+            ('rep_drift', 'Representation drift', 'Higher = more change', 'Cosine distance (observed range)', None),
             ('func_drift', 'Output distribution drift', 'Higher = more change', 'Symmetric KL (nats)', None),
         ]
         for column, (ax, (key, title, direction, xlabel, fixed_limit)) in enumerate(zip(axes, specifications)):
@@ -430,7 +430,7 @@ def plot_transitions(rows, output_dir):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     metrics = [('grad_cosine', 'Gradient cosine', -1, 1), ('lora_cosine', 'LoRA update cosine', -1, 1),
-               ('rep_drift', 'Representation cosine drift', 0, 2), ('cka', 'Linear CKA', 0, 1),
+               ('rep_drift', 'Representation drift', 0, 2), ('cka', 'Linear CKA', 0, 1),
                ('func_drift', 'Symmetric KL (nats)', 0, None), ('forgetting_pp', 'Forgetting (pp)', None, None)]
     fig, axes = plt.subplots(1, len(metrics), figsize=(16, max(4, len(rows) * 0.55 + 2)), sharey=True)
     for ax, (key, label, low, high) in zip(axes, metrics):
@@ -455,7 +455,7 @@ def plot_model_matrices(matrices, output_dir):
     import matplotlib.pyplot as plt
     for key, title, vmax in (
         ('cka_vs_base', 'Linear CKA vs base model', 1),
-        ('rep_drift_vs_base', 'Representation cosine drift vs base model', 2),
+        ('rep_drift_vs_base', 'Representation drift vs base model', 2),
         ('symmetric_kl_vs_base', 'Symmetric KL vs base model (nats)', None),
     ):
         values = np.array([[np.nan if value is None else value for value in row]
