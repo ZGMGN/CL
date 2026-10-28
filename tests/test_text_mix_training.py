@@ -10,7 +10,9 @@ from unittest.mock import patch
 
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM, TrainingArguments
+from torch.utils.data import BatchSampler
+from accelerate.data_loader import BatchSamplerShard
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
@@ -85,7 +87,7 @@ class TextMixTrainingTest(unittest.TestCase):
             write_task(root, 'AGNEWS', count=5)
             args = mixed.build_parser().parse_args([
                 '--tasks', 'AGNEWS', '--data_dir', str(root), '--output_dir', str(root / 'output'),
-                '--text_samples_per_task', '2', '--dry_run'])
+                '--text_samples_per_task', '2', '--mixing_strategy', 'sample', '--dry_run'])
             with patch.object(mixed, 'build_base_peft_model', side_effect=AssertionError('Dry run cannot load weights')):
                 plan = mixed.run_text_mix(args)
             info = plan['data']['AGNEWS']
@@ -104,11 +106,106 @@ class TextMixTrainingTest(unittest.TestCase):
                     mixed.run_text_mix(args)
                 build.assert_not_called()
             manifest_file.unlink()
+            args.mixing_strategy = 'step'
+            args.per_device_train_batch_size = 1
+            args.gradient_accumulation_steps = 2
+            with patch.object(mixed, 'build_base_peft_model') as build:
+                with self.assertRaisesRegex(ValueError, 'QA count 5 must be divisible'):
+                    mixed.run_text_mix(args)
+                build.assert_not_called()
+            args.mixing_strategy = 'sample'
             text_file.unlink()
             with patch.object(mixed, 'build_base_peft_model') as build:
                 with self.assertRaises(FileNotFoundError):
                     mixed.run_text_mix(args)
                 build.assert_not_called()
+
+    def test_trainer_sampler_falls_back_for_none_and_preserves_explicit_seed(self):
+        dataset = mixed.MixedTaskDataset([{'index': i} for i in range(64)], [[i] for i in range(32)])
+        with tempfile.TemporaryDirectory() as temporary:
+            for data_seed, expected_seed in ((None, 7), (0, 0), (13, 13)):
+                with self.subTest(data_seed=data_seed):
+                    args = TrainingArguments(
+                        output_dir=temporary, seed=7, data_seed=data_seed, use_cpu=True,
+                        per_device_train_batch_size=8, gradient_accumulation_steps=2,
+                        report_to='none', remove_unused_columns=False,
+                    )
+                    trainer = mixed.StepGroupedTrainer(
+                        model=torch.nn.Linear(1, 1), args=args, train_dataset=dataset,
+                        generation_eval_fn=None, generation_eval_kwargs={},
+                    )
+                    sampler = trainer._get_train_sampler()
+                    expected = mixed.HomogeneousStepSampler(64, 32, 16, seed=expected_seed)
+                    self.assertEqual(sampler.seed, expected_seed)
+                    self.assertEqual(list(sampler), list(expected))
+                    sampler.set_epoch(1)
+                    expected.set_epoch(1)
+                    self.assertEqual(list(sampler), list(expected))
+
+    def test_step_dry_run_iterates_sampler_with_resolved_training_seed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_task(root, 'AGNEWS', count=4)
+            args = mixed.build_parser().parse_args([
+                '--tasks', 'AGNEWS', '--data_dir', str(root), '--output_dir', str(root / 'output'),
+                '--text_samples_per_task', '2', '--per_device_train_batch_size', '1',
+                '--gradient_accumulation_steps', '2', '--seed', '7', '--dry_run'])
+            original_builder = mixed.sequential.build_training_args
+            original_iter = mixed.HomogeneousStepSampler.__iter__
+            observed_seeds = []
+
+            def build_with_default_data_seed(*positional, **kwargs):
+                training_args = original_builder(*positional, **kwargs)
+                training_args.data_seed = None
+                return training_args
+
+            def record_iteration(sampler):
+                observed_seeds.append(sampler.seed)
+                return original_iter(sampler)
+
+            with patch.object(mixed.sequential, 'build_training_args', side_effect=build_with_default_data_seed), \
+                    patch.object(mixed.HomogeneousStepSampler, '__iter__', record_iteration), \
+                    patch.object(mixed, 'build_base_peft_model') as build:
+                mixed.run_text_mix(args)
+                build.assert_not_called()
+            self.assertEqual(observed_seeds, [7])
+
+    def test_step_sampler_coverage_epoch_shuffle_and_update_boundaries(self):
+        sampler = mixed.HomogeneousStepSampler(64, 32, 16, seed=7)
+        first = list(sampler)
+        self.assertEqual(sorted(first), list(range(96)))
+        self.assertEqual(len(first), 96)
+        kinds = []
+        for start in range(0, len(first), 16):
+            block = first[start:start + 16]
+            self.assertEqual(len({index < 64 for index in block}), 1)
+            kinds.append('qa' if block[0] < 64 else 'text')
+        self.assertEqual(kinds.count('qa'), 4)
+        self.assertEqual(kinds.count('text'), 2)
+        self.assertEqual(first, list(sampler))
+        sampler.set_epoch(1)
+        second = list(sampler)
+        self.assertNotEqual(first, second)
+        self.assertEqual(sorted(second), sorted(first))
+        for counts in ((65, 32), (64, 33)):
+            with self.assertRaisesRegex(ValueError, 'must be divisible'):
+                mixed.HomogeneousStepSampler(*counts, 16)
+
+    def test_distributed_sharding_preserves_homogeneous_optimizer_groups(self):
+        # Two ranks, batch 4/rank, accumulation 2 -> global group size 16.
+        streams = []
+        for rank in range(2):
+            sampler = mixed.HomogeneousStepSampler(64, 32, 16, seed=7)
+            batches = BatchSampler(sampler, batch_size=4, drop_last=False)
+            shard = BatchSamplerShard(batches, num_processes=2, process_index=rank, split_batches=False)
+            streams.append(list(shard))
+        all_indices = []
+        for update in range(6):
+            global_group = [index for stream in streams for batch in stream[2*update:2*update+2] for index in batch]
+            self.assertEqual(len(global_group), 16)
+            self.assertEqual(len({index < 64 for index in global_group}), 1)
+            all_indices.extend(global_group)
+        self.assertEqual(sorted(all_indices), list(range(96)))
 
     def test_two_stage_training_uses_only_qa_metrics_and_carries_best_adapter(self):
         old_threads = torch.get_num_threads()
@@ -124,15 +221,25 @@ class TextMixTrainingTest(unittest.TestCase):
         starts, validation, tests, prepared = [], {'AGNEWS': [], 'AMAZON': []}, [], {}
         testcase = self
 
-        class RecordingTrainer(mixed.GenerationEvalTrainer):
+        microsteps = []
+
+        class RecordingTrainer(mixed.StepGroupedTrainer):
             def __init__(self, *args, **kwargs):
                 starts.append(snapshot(kwargs['model']))
+                self.recorded_microsteps = []
+                microsteps.append(self.recorded_microsteps)
                 dataset = kwargs['train_dataset']
                 testcase.assertIsInstance(dataset, mixed.MixedTaskDataset)
                 testcase.assertEqual(len(dataset), 4)
                 testcase.assertEqual([dataset[i]['sample_type'] for i in range(4)], ['qa', 'qa', 'text', 'text'])
                 testcase.assertIs(kwargs['eval_dataset'], prepared[tasks[len(starts) - 1]]['qa']['val'])
                 super().__init__(*args, **kwargs)
+
+            def training_step(self, model, inputs, *args, **kwargs):
+                targets = (inputs['labels'] != -100).sum(dim=1)
+                kind = 'qa' if bool((targets == 2).all()) else 'text'
+                self.recorded_microsteps.append((self.state.global_step, kind))
+                return super().training_step(model, inputs, *args, **kwargs)
 
         def evaluator(task):
             def evaluate(**kwargs):
@@ -165,16 +272,26 @@ class TextMixTrainingTest(unittest.TestCase):
             args = mixed.build_parser().parse_args([
                 '--tasks', ','.join(tasks), '--data_dir', str(root), '--output_dir', str(root / 'output'),
                 '--text_samples_per_task', '2', '--num_train_epochs', '2', '--num_workers', '0',
-                '--per_device_train_batch_size', '4', '--gradient_accumulation_steps', '1',
+                '--per_device_train_batch_size', '1', '--gradient_accumulation_steps', '2',
                 '--max_seq_length', '128', '--logging_steps', '1', '--warmup_ratio', '0',
             ])
             with patch.object(mixed, 'build_tokenizer', return_value=tokenizer), \
                  patch.object(mixed, 'build_base_peft_model', return_value=model) as build, \
                  patch.object(mixed, 'prepare_task_data', side_effect=prepare), \
                  patch.object(mixed, 'TASK_CONFIGS', configs), \
-                 patch.object(mixed, 'GenerationEvalTrainer', RecordingTrainer):
+                 patch.object(mixed, 'StepGroupedTrainer', RecordingTrainer):
                 summary = mixed.run_text_mix(args)
             build.assert_called_once()
+            for trace in microsteps:
+                groups = {}
+                for step, kind in trace:
+                    groups.setdefault(step, []).append(kind)
+                self.assertEqual(len(groups), 4)
+                self.assertEqual(len(trace), 8)
+                self.assertTrue(all(len(kinds) == 2 and len(set(kinds)) == 1 for kinds in groups.values()))
+                self.assertEqual(sum(kind == 'text' for _, kind in trace), 4)
+            self.assertEqual(summary['mixing_strategy'], 'step')
+            self.assertEqual(summary['optimizer_group_size'], 2)
             self.assertEqual([s['best_validation_accuracy'] for s in summary['stages']], [.9, .9])
             self.assertEqual([task for task, _ in tests], ['AGNEWS', 'AGNEWS', 'AMAZON'])
             self.assertTrue(same(starts[1], validation['AGNEWS'][0]))

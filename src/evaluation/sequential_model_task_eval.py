@@ -137,7 +137,7 @@ def collect_cached_outputs(args, tasks, models, probes, modules, layers, output_
                     temporary = path.with_suffix('.tmp')
                     torch.save(outputs, temporary)
                     temporary.replace(path)
-            all_outputs.append({task: torch.load(path, map_location='cpu', weights_only=True) for task, path in paths.items()})
+            all_outputs.append({task: torch.load(path, map_location='cpu', weights_only=True, mmap=True) for task, path in paths.items()})
             drift.save_json(output_dir / 'status.json', {'state': 'collecting', 'models_cached': stage + 1, 'models_total': len(models)})
     finally:
         del model, tokenizer
@@ -268,11 +268,28 @@ def persist_task_learned_reference(payload, output_dir):
     write_csv(output_dir / 'all_model_task_metrics.csv', payload['model_task_results'])
 
 
+def add_training_description(payload):
+    """Identify mixed-training reports without changing the reference metrics."""
+    path = Path(payload['run_dir']) / 'mixing_manifest.json'
+    if not path.is_file():
+        return
+    manifest = json.loads(path.read_text())
+    if manifest.get('training_mode') != 'sequential_qa_plus_text' or manifest['tasks'] != payload['tasks']:
+        raise ValueError('Training manifest does not describe this evaluation run')
+    payload['training_description'] = {
+        'mode': 'QA + natural text mixed sequential LoRA', 'manifest': str(path),
+        'qa_train_counts': {task: manifest['data'][task]['qa_train_count'] for task in payload['tasks']},
+        'text_train_counts': {task: manifest['data'][task]['text_train_count'] for task in payload['tasks']},
+        'performance_data': 'Original QA validation/test splits only; no text examples in evaluation',
+    }
+
+
 def refresh_reports(output_dir, mean_results_dir=None):
     """Rebuild derived comparisons and figures without loading datasets or models."""
     payload = json.loads((output_dir / 'all_model_task_metrics.json').read_text())
     if not payload.get('complete'):
         raise ValueError('Report-only mode requires complete model-pair metrics')
+    add_training_description(payload)
     if mean_results_dir is not None:
         payload['mean_pooling_results_dir'] = str(Path(mean_results_dir).resolve())
     persist_layer_results(payload, output_dir)
@@ -294,6 +311,11 @@ def write_analysis(payload, output_dir):
              f"{len(payload['pairwise_results'])} 组同任务模型对比较。", '',
              'M0 是 base；后续模型均为同一 base 加该阶段累计训练得到的 adapter。', '',
              '| 模型 | 累计训练任务 | adapter |', '| --- | --- | --- |']
+    if payload.get('training_description'):
+        description = payload['training_description']
+        notes = '；'.join(f"{task}: {description['qa_train_counts'][task]} QA + {description['text_train_counts'][task]} text" for task in tasks)
+        lines[1:1] = ['', '**训练方式：QA 与自然文本混合的顺序 LoRA。**', '', notes, '',
+                      '准确率与全部漂移分析均使用原始 QA 数据；新增训练文本不参与评估。', '']
     for item in models:
         relative = '无' if item['adapter_dir'] is None else str(Path(item['adapter_dir']).relative_to(Path(payload['run_dir'])))
         lines.append(f"| {item['model']} | {' → '.join(item['cumulative_tasks']) or '无'} | {relative} |")
@@ -401,6 +423,7 @@ def run_evaluation(args):
         'pairwise_matrices': matrices, 'layer_cka_matrices': layer_matrices,
         'model_task_results': model_rows, 'pairwise_results': pair_rows,
     }
+    add_training_description(payload)
     if args.mean_results_dir:
         payload['mean_pooling_results_dir'] = str(Path(args.mean_results_dir).resolve())
     drift.save_json(output_dir / 'all_model_task_metrics.json', payload)
@@ -486,7 +509,8 @@ def plot_report(payload, output_dir):
     with plt.rc_context({'font.size': 11, 'pdf.fonttype': 42, 'axes.spines.top': False, 'axes.spines.right': False, 'figure.max_open_warning': 0}):
         fig, ax = plt.subplots(figsize=(16, 9))
         ax.axis('off')
-        fig.suptitle('All models on every task: evaluation guide', fontsize=21, y=0.95)
+        guide_title = 'QA + text mixed training: all-model evaluation guide' if payload.get('training_description') else 'All models on every task: evaluation guide'
+        fig.suptitle(guide_title, fontsize=21, y=0.95)
         fig.text(0.07, 0.86, order, fontsize=13)
         table_rows = [[item['model'], ' → '.join(item['cumulative_tasks']) or 'Base model; no task training',
                        str(Path(item['adapter_dir']).relative_to(Path(payload['run_dir']))) if item['adapter_dir'] else 'No adapter'] for item in models]
@@ -510,6 +534,10 @@ def plot_report(payload, output_dir):
             'Model IDs always refer to cumulative adapters, rather than independently trained task-only models.',
             'Report order: LAST pooling, then MEAN pooling (layers 16/32), then directed KL and calculation methods.' if payload.get('mean_pooling_results_dir') else f"Pooling scheme: {payload['settings']['pooling'].upper()}",
         ]
+        if payload.get('training_description'):
+            description = payload['training_description']
+            counts_line = '; '.join(f"{task}: {description['qa_train_counts'][task]} QA + {description['text_train_counts'][task]} text" for task in tasks)
+            lines.append('Training only: ' + counts_line + '. Evaluation: QA only.')
         for index, text in enumerate(lines):
             fig.text(0.07, 0.43 - index * 0.042, text, fontsize=11)
         page(fig, 'model_task_guide')

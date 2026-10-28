@@ -1,4 +1,4 @@
-"""Sequential LoRA on the original QA training sets plus 200 text examples per task.
+"""Sequential LoRA on the original QA training sets plus 192 step-grouped text examples per task.
 
 QA targets are answer-only; raw text uses causal next-token targets. Validation,
 checkpoint selection and test performance use only the original QA datasets.
@@ -13,7 +13,7 @@ from functools import partial
 
 import torch
 from datasets import load_dataset
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR / 'src'))
@@ -75,6 +75,69 @@ class MixedTaskDataset(Dataset):
         if index < len(self.qa_dataset):
             return {'sample_type': 'qa', 'example': self.qa_dataset[index]}
         return {'sample_type': 'text', 'input_ids': self.text_input_ids[index - len(self.qa_dataset)]}
+
+
+class HomogeneousStepSampler(Sampler):
+    """Shuffle whole optimizer groups; never mix QA/text within an update.
+
+    The order is global. Accelerate shards microbatches across ranks, so a group
+    contains local_batch_size * accumulation_steps * world_size examples.
+    """
+
+    def __init__(self, qa_count, text_count, group_size, seed=1):
+        if group_size < 1 or qa_count < 1 or text_count < 1:
+            raise ValueError('Group size and both source counts must be positive')
+        for name, count in (('QA', qa_count), ('text', text_count)):
+            if count % group_size:
+                raise ValueError(
+                    f'{name} count {count} must be divisible by optimizer group size {group_size}; '
+                    'samples are never dropped, repeated or mixed across group boundaries.'
+                )
+        self.qa_count = qa_count
+        self.text_count = text_count
+        self.group_size = group_size
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self.qa_count + self.text_count
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        qa = torch.randperm(self.qa_count, generator=generator).tolist()
+        text = (torch.randperm(self.text_count, generator=generator) + self.qa_count).tolist()
+        groups = [source[start:start + self.group_size]
+                  for source in (qa, text) for start in range(0, len(source), self.group_size)]
+        order = torch.randperm(len(groups), generator=generator).tolist()
+        return iter(index for group_index in order for index in groups[group_index])
+
+
+def resolve_data_seed(training_args):
+    """Match Trainer's fallback while preserving an explicitly configured seed of 0."""
+    return training_args.seed if training_args.data_seed is None else training_args.data_seed
+
+
+class StepGroupedTrainer(GenerationEvalTrainer):
+    """Keep the QA-only evaluator and replace only the training sampler."""
+
+    def __init__(self, *args, mixing_strategy='step', **kwargs):
+        if mixing_strategy not in ('step', 'sample'):
+            raise ValueError('mixing_strategy must be step or sample')
+        self.mixing_strategy = mixing_strategy
+        super().__init__(*args, **kwargs)
+
+    def _get_train_sampler(self, train_dataset=None):
+        if self.mixing_strategy == 'sample':
+            return super()._get_train_sampler(train_dataset)
+        dataset = self.train_dataset if train_dataset is None else train_dataset
+        if not isinstance(dataset, MixedTaskDataset):
+            raise ValueError('Step-grouped training requires MixedTaskDataset')
+        group_size = self._train_batch_size * self.args.gradient_accumulation_steps * self.args.world_size
+        return HomogeneousStepSampler(len(dataset.qa_dataset), len(dataset.text_input_ids),
+                                      group_size, resolve_data_seed(self.args))
 
 
 class MixedDataCollator:
@@ -171,7 +234,8 @@ def prepare_task_data(task, args, tokenizer):
 def output_path(args, tasks):
     if args.output_dir:
         return Path(args.output_dir).expanduser().resolve()
-    name = (f'text_mix_{"_".join(tasks)}_seed_{args.seed}_text{args.text_samples_per_task}'
+    prefix = 'text_mix_step' if args.mixing_strategy == 'step' else 'text_mix'
+    name = (f'{prefix}_{"_".join(tasks)}_seed_{args.seed}_text{args.text_samples_per_task}'
             f'_bs{args.per_device_train_batch_size}_ga{args.gradient_accumulation_steps}')
     return ROOT_DIR / 'results' / name
 
@@ -192,13 +256,28 @@ def run_text_mix(args):
     tokenizer.model_max_length = args.max_seq_length
     # Check every task and every full text before allocating the base model.
     prepared = {task: prepare_task_data(task, args, tokenizer) for task in dict.fromkeys(tasks)}
+    preflight_args = sequential.build_training_args(args, str(destination))
+    group_size = preflight_args.train_batch_size * args.gradient_accumulation_steps * preflight_args.world_size
+    if args.mixing_strategy == 'step':
+        for entry in prepared.values():
+            info = entry['metadata']
+            sampler = HomogeneousStepSampler(info['qa_train_count'], info['text_train_count'],
+                                             group_size, resolve_data_seed(preflight_args))
+            # Exercise iteration too: constructor-only checks miss invalid RNG seeds.
+            next(iter(sampler))
+            info.update(qa_update_groups=info['qa_train_count'] // group_size,
+                        text_update_groups=info['text_train_count'] // group_size)
+    mixing = ('Shuffle QA and text separately, form homogeneous optimizer groups, then shuffle the whole groups each epoch.'
+              if args.mixing_strategy == 'step' else 'Shuffle individual QA/text examples each epoch.')
     plan = {
         'tasks': tasks, 'training_mode': 'sequential_qa_plus_text', 'base_model': str(Path(MODEL_DIR).resolve()),
         'output_dir': str(destination), 'settings': vars(args).copy(),
+        'mixing_strategy': args.mixing_strategy, 'optimizer_group_size': group_size,
+        'world_size': preflight_args.world_size,
         'loss': {'qa': 'Answer-only targets, including the assistant end marker; prompt tokens are masked.',
                  'text': 'Next-token targets on the full raw document and EOS; no chat template; no padding targets.',
                  'reduction': 'Standard causal-LM cross-entropy over supervised tokens; no separate task loss weighting.',
-                 'mixing': 'Shuffle the entire QA+text dataset each epoch; no fixed per-batch QA/text quota.'},
+                 'mixing': mixing},
         'evaluation': {'data': 'QA only', 'checkpoint_metric': 'validation QA accuracy',
                        'test_tasks_after_each_stage': 'All tasks seen so far; original full QA test splits.'},
         'data': {task: value['metadata'] for task, value in prepared.items()},
@@ -209,7 +288,10 @@ def run_text_mix(args):
         for task, entry in prepared.items():
             info = entry['metadata']
             print(f'{task}: {info["qa_train_count"]} QA + {info["text_train_count"]} text = '
-                  f'{info["mixed_train_count"]} training rows; validation/test: QA only', flush=True)
+                  f'{info["mixed_train_count"]} training rows; mixing={args.mixing_strategy}; validation/test: QA only', flush=True)
+            if args.mixing_strategy == 'step':
+                print(f'  {info["qa_update_groups"]} QA updates + {info["text_update_groups"]} text updates; '
+                      f'{group_size} examples per global optimizer group', flush=True)
     if args.dry_run:
         if is_main:
             print(f'Data check complete; no model weights loaded. Manifest: {destination / "mixing_manifest.json"}', flush=True)
@@ -219,14 +301,16 @@ def run_text_mix(args):
     eval_kwargs = {'batch_size': args.per_device_eval_batch_size, 'max_input_length': args.max_seq_length,
                    'max_new_tokens': args.max_new_tokens, 'print_sample': False}
     summary = {'tasks': tasks, 'training_mode': 'sequential_qa_plus_text',
-               'mixing_manifest': str(destination / 'mixing_manifest.json'), 'stages': []}
+               'mixing_manifest': str(destination / 'mixing_manifest.json'),
+               'mixing_strategy': args.mixing_strategy, 'optimizer_group_size': group_size, 'stages': []}
     seen_tasks = []
     for index, task in enumerate(tasks, 1):
         _, pair_formatter, evaluator = TASK_CONFIGS[task]
         entry = prepared[task]
         stage_dir = destination / f'{index:02d}_{task}'
         model.config.use_cache = False
-        trainer = GenerationEvalTrainer(
+        trainer = StepGroupedTrainer(
+            mixing_strategy=args.mixing_strategy,
             model=model, args=sequential.build_training_args(args, str(stage_dir)), processing_class=tokenizer,
             data_collator=MixedDataCollator(tokenizer, args.max_seq_length, partial(pair_formatter, tokenizer=tokenizer)),
             train_dataset=entry['mixed_train'], eval_dataset=entry['qa']['val'],
@@ -273,9 +357,11 @@ def build_parser():
     parser.description = __doc__
     parser.set_defaults(output_dir=None)
     parser.add_argument('--data_dir', default=str(ROOT_DIR / 'data'),
-                        help='QA: TASK/{train,val,test}.jsonl; text: TASK_text/TASK_domain_200.jsonl')
-    parser.add_argument('--text_samples_per_task', type=int, default=200,
-                        help='Number of added text rows; reads TASK_text/TASK_domain_<N>.jsonl (default: 200)')
+                        help='QA: TASK/{train,val,test}.jsonl; text: TASK_text/TASK_domain_<N>.jsonl')
+    parser.add_argument('--text_samples_per_task', type=int, default=192,
+                        help='Number of added text rows; reads TASK_text/TASK_domain_<N>.jsonl (default: 192)')
+    parser.add_argument('--mixing_strategy', choices=('step', 'sample'), default='step',
+                        help='step: shuffle homogeneous optimizer groups; sample: reproduce individual-example mixing')
     parser.add_argument('--dry_run', action='store_true',
                         help='Check full datasets, text lengths and provenance; write the plan without loading model weights')
     return parser
