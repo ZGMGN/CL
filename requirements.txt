@@ -1,0 +1,22 @@
+# Versions recorded from the environment running the three-order experiment.
+# Python 3.12; current GPU build: torch 2.12.1+cu130.
+# Install a PyTorch build compatible with your GPU/CUDA before the other packages.
+# This file records installed versions; a clean-environment install has not been tested.
+
+# Training and generation
+torch==2.12.1
+transformers==5.20.1
+datasets==5.1.0
+peft==0.21.2
+accelerate==1.15.0
+
+# Numerical analysis and plots
+numpy==2.4.6
+matplotlib==3.11.0
+Pillow==12.2.0
+tqdm==4.70.1
+
+# Model/tokenizer serialization
+safetensors==0.8.0
+tokenizers==0.23.3
+huggingface-hub==2.2.0

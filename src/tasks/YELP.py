@@ -15,9 +15,12 @@ import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
+from tasks.label_utils import build_instruction, extract_answer_label as _extract_answer_label
 from metrics import compute_accuracy
 from model.utils import GENERAL_TEMPLATE, render_chat
 YELP_CHAT_TEMPLATE_LLAMA31 = GENERAL_TEMPLATE
+
+LABELS = ('very negative', 'negative', 'neutral', 'positive', 'very positive')
 
 __all__ = [
     "YELP_CHAT_TEMPLATE_LLAMA31",
@@ -25,39 +28,26 @@ __all__ = [
     "render_chat",
     "format_prompt",
     "extract_answer_letter",
+    "extract_answer_label",
+    "LABELS",
     "extract_label_from_example",
 ]
 
 
-def _build_answer(index:int)->str:
-    letters = string.ascii_uppercase[:5]
-    if index < 0 or index > len(letters)-1:
-        raise ValueError(f'Option must be in [0, {len(letters)-1}],but got {index}.')
-    return letters[index]
+def _build_answer(index: int) -> str:
+    if index < 0 or index >= len(LABELS):
+        raise ValueError(f'Label index must be in [0, {len(LABELS)-1}], got {index}')
+    return LABELS[index]
 
 _prompt_text = '###Review: '
-_prompt_format_after = (
-    'What is the star rating of this business review?\n'
-    'A. 1 star\n'
-    'B. 2 stars\n'
-    'C. 3 stars\n'
-    'D. 4 stars\n'
-    'E. 5 stars\n'
-    'Answer with A, B, C, D or E only.\n'
-    'Answer:'
-)
 
-def _single_example_to_message(example:Dict[str, Any])->List[Dict[str,str]]:
+
+def _single_example_to_message(example: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
-        {
-            'role':'user',
-            'content':_prompt_text+(example['text'] or '').strip()+ '\n'+_prompt_format_after
-        },
-        {
-            'role':'assistant',
-            'content':_build_answer(example['label'])
-        },
+        {'role': 'user', 'content': build_instruction(example, LABELS, 'SC', [('text', 'Text')])},
+        {'role': 'assistant', 'content': _build_answer(example['label'])},
     ]
+
 
 def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
     if isinstance(example['text'],str) or example['text'] is None:
@@ -81,32 +71,13 @@ def format_prompt(example:Dict[str,Any],tokenizer,include_answer):
         messages = [msg for msg in messages if msg['role'] != 'assistant']
     return render_chat(messages, tokenizer, add_generation_prompt= not include_answer)
 
-def extract_answer_letter(text: str) -> Optional[str]:
-    text_u = text.strip().upper()
+def extract_answer_label(text: str) -> Optional[str]:
+    return _extract_answer_label(text, LABELS)
 
-    # 例如：B、B.、(B)、B)
-    m = re.fullmatch(r"\(?([ABCDE])\)?[.。]?\)?", text_u)
-    if m:
-        return m.group(1)
 
-    # 例如：The correct answer is B、Answer: C、Option D
-    m = re.search(
-        r"\b(?:"
-        r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
-        r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
-        r"|OPTION|CHOICE"
-        r")\s*[:：]?\s*\(?([ABCDE])\b",
-        text_u,
-    )
-    if m:
-        return m.group(1)
+# Keep existing callers working; this now returns a category name.
+extract_answer_letter = extract_answer_label
 
-    # 例如：B. 后面跟选项说明
-    m = re.match(r"^([ABCDE])[.)、]\s*", text_u)
-    if m:
-        return m.group(1)
-
-    return None
 
 def extract_label_from_example(example):
     messages = example_to_messages(example)
@@ -241,7 +212,7 @@ if __name__ == '__main__':
     # Sanity check: label extraction.
     gold_label = extract_label_from_example(sample)
     parsed_label = extract_answer_letter(example_to_messages(sample)[-1]["content"])
-    assert gold_label in 'ABCDE'
+    assert gold_label in LABELS
     assert gold_label == parsed_label
     print(f"\nGold label: {gold_label}, Parsed label: {parsed_label}")
 

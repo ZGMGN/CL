@@ -52,16 +52,17 @@ class StandardCLTasksTest(unittest.TestCase):
             with self.subTest(task=task):
                 rows = [{**{field: f'{field} content' for field in fields}, 'label': label} for label in range(count)]
                 for label, row in enumerate(rows):
-                    letter = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[label]
+                    letter = module.LABELS[label]
                     messages = module.example_to_messages(row)
                     self.assertEqual(messages[-1]['content'], letter)
                     self.assertEqual(module.extract_label_from_example(row), letter)
                     for field in fields:
                         self.assertIn(row[field], messages[0]['content'])
-                    self.assertEqual(module.extract_answer_letter(f'The correct answer is {letter}.'), letter)
+                    self.assertEqual(module.extract_answer_letter(f'  {letter.upper()}.  '), letter)
                 batch = {key: [row[key] for row in rows] for key in rows[0]}
                 self.assertEqual(module.example_to_messages(batch), [module.example_to_messages(row) for row in rows])
-                self.assertEqual(module.extract_answer_letter('I think the answer is B'), 'B')
+                self.assertIsNone(module.extract_answer_letter('I think the answer is B'))
+                self.assertIsNone(module.extract_answer_letter('The answer is ' + module.LABELS[0]))
                 self.assertIsNone(module.extract_answer_letter('I think so'))
                 self.assertIsNone(module.extract_answer_letter('Z'))
                 for label in (-1, count):
@@ -113,7 +114,7 @@ class StandardCLTasksTest(unittest.TestCase):
                 prompt = module.format_prompt(row, self.tokenizer, include_answer=False)
                 self.assertTrue(prompt.endswith('<|start_header_id|>assistant<|end_header_id|>\n\n'))
                 full = module.format_prompt(row, self.tokenizer, include_answer=True)
-                self.assertTrue(full.endswith('<|start_header_id|>assistant<|end_header_id|>\n\nA<|eot_id|>'))
+                self.assertTrue(full.endswith('<|start_header_id|>assistant<|end_header_id|>\n\n' + module.LABELS[0] + '<|eot_id|>'))
 
     def test_amazon_main_loads_source_once_and_reads_jsonl(self):
         self._check_main_loads_source_once('AMAZON', 'vgaraujov/amazon_review_full', 3000)

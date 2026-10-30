@@ -15,9 +15,12 @@ import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
+from tasks.label_utils import build_instruction, extract_answer_label as _extract_answer_label
 from metrics import compute_accuracy
 from model.utils import GENERAL_TEMPLATE, render_chat
 QQP_CHAT_TEMPLATE_LLAMA31 = GENERAL_TEMPLATE
+
+LABELS = ('False', 'True')
 
 __all__ = [
     "QQP_CHAT_TEMPLATE_LLAMA31",
@@ -25,6 +28,8 @@ __all__ = [
     "render_chat",
     "format_prompt",
     "extract_answer_letter",
+    "extract_answer_label",
+    "LABELS",
     "extract_label_from_example",
 ]
 
@@ -34,33 +39,19 @@ _prompt_question1 = (
 _prompt_question2 = (
     '###Question2: '
 )
-_prompt_format_after = (
-    'Are these two questions duplicates?\n'
-    'A. No\n'
-    'B. Yes\n'
-    'Answer with A or B only.\n'
-    'Answer:'
-)
 
-def _build_answer(index:int)->str:
-    letters = string.ascii_uppercase
-    if index <0 or index >= len(letters):
-        raise ValueError(f'Option index must be in [0, {len(letters)-1}], but got {index}.')
-    return letters[index]
 
-def _single_example_to_message(example:Dict[str, Any])->List[Dict[str, str]]:
+def _build_answer(index: int) -> str:
+    if index < 0 or index >= len(LABELS):
+        raise ValueError(f'Label index must be in [0, {len(LABELS)-1}], got {index}')
+    return LABELS[index]
+
+def _single_example_to_message(example: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
-        {
-            'role':'user',
-            'content':_prompt_question1+example['question1']+'\n'
-            +_prompt_question2+example['question2']+'\n'
-            +_prompt_format_after
-        },
-        {
-            'role':'assistant',
-            'content':_build_answer(example['label'])
-        },
+        {'role': 'user', 'content': build_instruction(example, LABELS, 'QQP', [('question1', 'first sentence'), ('question2', 'second sentence')])},
+        {'role': 'assistant', 'content': _build_answer(example['label'])},
     ]
+
 
 def example_to_messages(example: Dict[str, Any])-> List[Dict[str, str]]:
     if isinstance(example['question1'], str):
@@ -85,32 +76,13 @@ def format_prompt(example:Dict[str,Any],tokenizer,include_answer:bool=False)->st
         messages = [msg for msg in messages if msg['role']!='assistant']
     return render_chat(messages, tokenizer, add_generation_prompt=not include_answer)
 
-def extract_answer_letter(text: str) -> Optional[str]:
-    text_u = text.strip().upper()
+def extract_answer_label(text: str) -> Optional[str]:
+    return _extract_answer_label(text, LABELS)
 
-    # A、B、(A)、B.、B)
-    m = re.fullmatch(r"\(?([AB])\)?[.。]?\)?", text_u)
-    if m:
-        return m.group(1)
 
-    # Answer: B、The correct answer is B、Option A
-    m = re.search(
-        r"\b(?:"
-        r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
-        r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
-        r"|OPTION|CHOICE"
-        r")\s*[:：]?\s*\(?([AB])\b",
-        text_u,
-    )
-    if m:
-        return m.group(1)
+# Keep existing callers working; this now returns a category name.
+extract_answer_letter = extract_answer_label
 
-    # A. No、B) Yes
-    m = re.match(r"^([AB])[.)、]\s*", text_u)
-    if m:
-        return m.group(1)
-
-    return None
 
 def extract_label_from_example(example:Dict[str,Any])->Optional[str]:
     messages = example_to_messages(example)

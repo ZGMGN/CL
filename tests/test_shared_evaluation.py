@@ -60,12 +60,12 @@ class SharedEvaluationTest(unittest.TestCase):
                 samples = [max(rows, key=lambda row: row['label']), rows[0], rows[-1]]
                 labels = [module.extract_label_from_example(row) for row in samples]
                 wrong = 'B' if labels[1] == 'A' else 'A'
-                model = FakeModel(self.tokenizer, [labels[0], wrong, 'unknown'])
+                model = FakeModel(self.tokenizer, ['  ' + labels[0].upper() + '.  ', wrong, 'unknown'])
                 results, metrics = evaluate(
                     model, self.tokenizer, samples, 'cpu',
                     batch_size=2, print_sample=False,
                 )
-                self.assertEqual(metrics, {'accuracy': 1 / 3, 'correct': 1, 'total': 3})
+                self.assertEqual(metrics, {'accuracy': 1 / 3, 'exact_match': 100.0 / 3, 'correct': 1, 'total': 3})
                 self.assertEqual([r['index'] for r in results], [0, 1, 2])
                 self.assertEqual(results[0]['predicted_answer'], labels[0])
                 self.assertIsNone(results[2]['predicted_answer'])

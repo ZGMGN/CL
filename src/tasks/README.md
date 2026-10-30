@@ -14,7 +14,11 @@ project experiment splits, not the published benchmark's exact evaluation protoc
 Amazon uses a community-hosted copy of the five-star review dataset. Its label
 values are already 0–4; do not subtract one. Yahoo's `topic` column is renamed
 to `label`. All four modules export zero-based `label`, source row `idx`, and the
-original text fields. Prompts map labels to A–E, A–E, A–N, and A–J respectively.
+original text fields. At runtime, prompts list category names and assistant targets
+contain the category name directly, following O-LoRA's instruction format.
+AMAZON / YELP map 0–4 to `very negative`, `negative`, `neutral`, `positive`,
+`very positive`. DBPEDIA and YAHOO use the names in each module's `LABELS`.
+Changing this runtime mapping does not require rewriting existing JSONL data.
 
 From the project directory, run any task separately:
 
@@ -40,8 +44,7 @@ DBPEDIA uses 1000/125/125, and YAHOO uses 1000/200/200:
 | DBPEDIA | 14000 | 1750 | 1750 |
 | YAHOO | 10000 | 2000 | 2000 |
 
-Each module follows the AGNEWS / QQP / SST2 file structure: explicit prompt
-strings, `_single_example_to_message`, `example_to_messages`, `render_chat`,
+Each module follows the AGNEWS / QQP / SST2 file structure: shared instruction construction in `label_utils.py`, `_single_example_to_message`, `example_to_messages`, `render_chat`,
 `format_prompt`, answer / label extraction, accuracy, `load_<task>_data`,
 `_balanced_subsample`, `build_<task>_files`, and an inline `__main__` block.
 Loaders return a dictionary of full custom splits; builders call the loader
@@ -58,7 +61,11 @@ As in AGNEWS / QQP / SST2, `format_prompt` and `extract_label_from_example`
 operate on single examples; pass batched messages to `render_chat` one by one.
 `format_prompt` takes an explicit `include_answer` argument. Set the module's
 `<TASK>_CHAT_TEMPLATE_LLAMA31` on the tokenizer when using Llama 3.1.
-Pass only generated response text to `extract_answer_letter`.
+Pass only generated response text to `extract_answer_label`.
+`extract_answer_letter` remains a compatibility alias and also returns category names.
+Matching lowercases text, removes ASCII punctuation and collapses whitespace, then
+requires the entire normalized response to equal a category name. Explanatory
+answers and letter-only answers are not accepted.
 
 Offline checks (synthetic data; no dataset download):
 
@@ -116,4 +123,5 @@ regenerating its data is an explicit call to `build_agnews_files`.
 
 Full generation evaluation uses the local exported test JSONL and is separate
 from these data preparation sanity checks. See the [project README](../../README.md)
-for the six evaluation scripts, ordinary LoRA loading, output fields and baseline results.
+for the seven evaluation scripts, ordinary LoRA loading, label mappings, output
+fields, three-order training queue, complete evaluation and step/loss plots.

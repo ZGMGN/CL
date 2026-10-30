@@ -139,6 +139,7 @@ def evaluate_qa(
         total = len(results)
         metrics = {
             "accuracy": correct/total if total else 0.0,
+            "exact_match": 100.0 * correct/total if total else 0.0,
             "correct": correct,
             "total":total
         }

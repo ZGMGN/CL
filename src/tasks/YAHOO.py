@@ -15,9 +15,12 @@ import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
+from tasks.label_utils import build_instruction, extract_answer_label as _extract_answer_label
 from metrics import compute_accuracy
 from model.utils import GENERAL_TEMPLATE, render_chat
 YAHOO_CHAT_TEMPLATE_LLAMA31 = GENERAL_TEMPLATE
+
+LABELS = ('Society & Culture', 'Science & Mathematics', 'Health', 'Education & Reference', 'Computers & Internet', 'Sports', 'Business & Finance', 'Entertainment & Music', 'Family & Relationships', 'Politics & Government')
 
 __all__ = [
     "YAHOO_CHAT_TEMPLATE_LLAMA31",
@@ -25,48 +28,28 @@ __all__ = [
     "render_chat",
     "format_prompt",
     "extract_answer_letter",
+    "extract_answer_label",
+    "LABELS",
     "extract_label_from_example",
 ]
 
 
-def _build_answer(index:int)->str:
-    letters = string.ascii_uppercase[:10]
-    if index < 0 or index > len(letters)-1:
-        raise ValueError(f'Option must be in [0, {len(letters)-1}],but got {index}.')
-    return letters[index]
+def _build_answer(index: int) -> str:
+    if index < 0 or index >= len(LABELS):
+        raise ValueError(f'Label index must be in [0, {len(LABELS)-1}], got {index}')
+    return LABELS[index]
 
 _prompt_question_title = '###Question title: '
 _prompt_question_content = '###Question content: '
 _prompt_best_answer = '###Best answer: '
-_prompt_format_after = (
-    'What is the topic of this question and answer?\n'
-    'A. Society & Culture\n'
-    'B. Science & Mathematics\n'
-    'C. Health\n'
-    'D. Education & Reference\n'
-    'E. Computers & Internet\n'
-    'F. Sports\n'
-    'G. Business & Finance\n'
-    'H. Entertainment & Music\n'
-    'I. Family & Relationships\n'
-    'J. Politics & Government\n'
-    'Answer with A, B, C, D, E, F, G, H, I or J only.\n'
-    'Answer:'
-)
 
-def _single_example_to_message(example:Dict[str, Any])->List[Dict[str,str]]:
+
+def _single_example_to_message(example: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
-        {
-            'role':'user',
-            'content':_prompt_question_title+(example['question_title'] or '').strip()+ '\n'
-            +_prompt_question_content+(example['question_content'] or '').strip()+ '\n'
-            +_prompt_best_answer+(example['best_answer'] or '').strip()+ '\n'+_prompt_format_after
-        },
-        {
-            'role':'assistant',
-            'content':_build_answer(example['label'])
-        },
+        {'role': 'user', 'content': build_instruction(example, LABELS, 'TC', [('question_title', 'Title'), ('question_content', 'Question'), ('best_answer', 'Answer')])},
+        {'role': 'assistant', 'content': _build_answer(example['label'])},
     ]
+
 
 def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
     if isinstance(example['question_title'],str) or example['question_title'] is None:
@@ -92,32 +75,13 @@ def format_prompt(example:Dict[str,Any],tokenizer,include_answer):
         messages = [msg for msg in messages if msg['role'] != 'assistant']
     return render_chat(messages, tokenizer, add_generation_prompt= not include_answer)
 
-def extract_answer_letter(text: str) -> Optional[str]:
-    text_u = text.strip().upper()
+def extract_answer_label(text: str) -> Optional[str]:
+    return _extract_answer_label(text, LABELS)
 
-    # 例如：B、B.、(B)、B)
-    m = re.fullmatch(r"\(?([ABCDEFGHIJ])\)?[.。]?\)?", text_u)
-    if m:
-        return m.group(1)
 
-    # 例如：The correct answer is B、Answer: C、Option D
-    m = re.search(
-        r"\b(?:"
-        r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
-        r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
-        r"|OPTION|CHOICE"
-        r")\s*[:：]?\s*\(?([ABCDEFGHIJ])\b",
-        text_u,
-    )
-    if m:
-        return m.group(1)
+# Keep existing callers working; this now returns a category name.
+extract_answer_letter = extract_answer_label
 
-    # 例如：B. 后面跟选项说明
-    m = re.match(r"^([ABCDEFGHIJ])[.)、]\s*", text_u)
-    if m:
-        return m.group(1)
-
-    return None
 
 def extract_label_from_example(example):
     messages = example_to_messages(example)
@@ -310,7 +274,7 @@ if __name__ == '__main__':
     # Sanity check: label extraction.
     gold_label = extract_label_from_example(sample)
     parsed_label = extract_answer_letter(example_to_messages(sample)[-1]["content"])
-    assert gold_label in 'ABCDEFGHIJ'
+    assert gold_label in LABELS
     assert gold_label == parsed_label
     print(f"\nGold label: {gold_label}, Parsed label: {parsed_label}")
 

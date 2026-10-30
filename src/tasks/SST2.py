@@ -15,9 +15,12 @@ import sys
 import_dir = os.path.join(ROOT_DIR, 'src')
 sys.path.insert(0, import_dir)
 
+from tasks.label_utils import build_instruction, extract_answer_label as _extract_answer_label
 from metrics import compute_accuracy
 from model.utils import GENERAL_TEMPLATE, render_chat
 SST2_CHAT_TEMPLATE_LLAMA31 = GENERAL_TEMPLATE
+
+LABELS = ('Bad', 'Good')
 
 __all__ = [
     "SST2_CHAT_TEMPLATE_LLAMA31",
@@ -25,35 +28,26 @@ __all__ = [
     "render_chat",
     "format_prompt",
     "extract_answer_letter",
+    "extract_answer_label",
+    "LABELS",
     "extract_label_from_example",
 ]
 
 
 _prompt_sentence = '###Sentence: '
-_prompt_format_after = (
-    'What is the sentiment of this sentence?\n'
-    'A. Negative\n'
-    'B. Positive\n'
-    'Answer with A or B only.\n'
-    'Answer:'
-)
+
 
 def _build_answer(index: int) -> str:
-    if index not in (0, 1):
-        raise ValueError(f'SST-2 label must be 0 or 1, got {index}')
-    return 'AB'[index]
+    if index < 0 or index >= len(LABELS):
+        raise ValueError(f'Label index must be in [0, {len(LABELS)-1}], got {index}')
+    return LABELS[index]
 
 def _single_example_to_message(example: Dict[str, Any]) -> List[Dict[str, str]]:
     return [
-        {
-            'role': 'user',
-            'content': _prompt_sentence + example['sentence'].strip() + '\n' + _prompt_format_after,
-        },
-        {
-            'role': 'assistant',
-            'content': _build_answer(example['label']),
-        },
+        {'role': 'user', 'content': build_instruction(example, LABELS, 'SC', [('sentence', 'Text')])},
+        {'role': 'assistant', 'content': _build_answer(example['label'])},
     ]
+
 
 def example_to_messages(example: Dict[str, Any]) -> List[Dict[str,str]]:
     if isinstance(example['sentence'],str):
@@ -78,32 +72,12 @@ def format_prompt(example:Dict[str,Any],tokenizer,include_answer):
         messages = [msg for msg in messages if msg['role'] != 'assistant']
     return render_chat(messages, tokenizer, add_generation_prompt= not include_answer)
 
-def extract_answer_letter(text: str) -> Optional[str]:
-    text_u = text.strip().upper()
+def extract_answer_label(text: str) -> Optional[str]:
+    return _extract_answer_label(text, LABELS)
 
-    # 例如：B、B.、(B)、B)
-    m = re.fullmatch(r"\(?([AB])\)?[.。]?\)?", text_u)
-    if m:
-        return m.group(1)
 
-    # 例如：The correct answer is B、Answer: A、Option B
-    m = re.search(
-        r"\b(?:"
-        r"(?:THE\s+)?(?:CORRECT\s+)?ANSWER"
-        r"\s*(?:IS\b|:|：|-)?\s*(?:OPTION\b|CHOICE\b)?"
-        r"|OPTION|CHOICE"
-        r")\s*[:：]?\s*\(?([AB])\b",
-        text_u,
-    )
-    if m:
-        return m.group(1)
-
-    # 例如：A. Negative、B) Positive
-    m = re.match(r"^([AB])[.)、]\s*", text_u)
-    if m:
-        return m.group(1)
-
-    return None
+# Keep existing callers working; this now returns a category name.
+extract_answer_letter = extract_answer_label
 
 
 def extract_label_from_example(example):
